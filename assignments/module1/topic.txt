@@ -1,7 +1,7 @@
 Создание (внутри kafka-init):
 /usr/bin/kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic orders.created.protobuf --partitions 3 --replication-factor 2
 
-Проверка (из assignments/module1):
+Проверка (из этой папки):
 docker-compose exec -T kafka /usr/bin/kafka-topics --bootstrap-server kafka:29092 --describe --topic orders.created.protobuf
 
 Вывод от 2026-10-11T10:23:43Z:
