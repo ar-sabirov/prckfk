@@ -1,0 +1,16 @@
+.git
+**/target
+**/out
+**/.kotlin
+**/.idea
+**/*.iml
+.omo
+**/.DS_Store
+**/*.class
+**/*.jar
+**/*.log
+**/*.hprof
+**/hs_err_pid*
+**/replay_pid*
+**/.env
+**/.env.*
