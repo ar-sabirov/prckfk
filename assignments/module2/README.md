@@ -109,6 +109,132 @@ Final per-user statistics:
 Bob and Carol each reached two distinct recipients, but the global unique
 recipient count is three because Alice appears in both sets.
 
+## Events, topics, and keys
+
+The wire models are defined in [chat.proto](../../src/main/proto/chat.proto).
+Maven generates their Java classes in the `module2.chat.proto` package for use
+from the JVM application. Topic names and partition counts are defined in
+[ChatTopics.kt](../../src/main/kotlin/module2/chat/ChatTopics.kt).
+
+All Kafka keys are non-null UTF-8 strings, serialized with `StringSerializer`.
+Non-null values are Protobuf bytes. The examples below use Protobuf text format
+for readability; they are not JSON records or commands to run.
+
+### Topic contracts
+
+| Topic | Key | Value | Partitions | Cleanup policy |
+| --- | --- | --- | --- | --- |
+| `module2.chat.messages` | `sender_id` | `ChatMessage` | 3 | `delete` |
+| `module2.chat.users` | `user_id` | `User`, or a tombstone to remove membership | 1 | `compact` |
+| `module2.chat.block-commands` | `blocked_sender_id` | `BlockCommand` | 3 | `delete`; retain the command history for this exercise (`retention.ms=-1`) |
+| `module2.chat.stop-words` | Normalized `word` | `StopWord`, or a tombstone to remove the word | 1 | `compact` |
+| `module2.chat.deliveries` | `message.sender_id` | `DeliveryEnvelope` | 3 | `delete` |
+
+These are the contracts for topic creation in step 3; no topics are created by
+the models or constants. Statistics contracts will be added with steps 7 and 8.
+Three sender partitions are a small demonstration choice that allows work to be
+split across multiple tasks. This number is independent of the number of users;
+many senders can share one partition.
+
+Messages and block commands are event logs. In particular, do not compact block
+commands by sender ID: Alice's block of Bob and Carol's block of Bob are separate
+commands with the same key. Keeping only the latest command would lose part of
+the blocking state when rebuilding it. The application will aggregate commands
+into its inverse blocking index in step 5.
+
+Users and stop words describe current state. A non-null record creates or
+replaces the entry for its key. A tombstone is a Kafka record with a key and a
+null value; it deletes that entry. It is not an empty Protobuf message or the
+string `"null"`. Compaction can discard superseded values while retaining the
+state needed by a table. Removing a user does not erase historical statistics.
+
+### Model rules
+
+- `ChatMessage` contains `message_id`, `sender_id`, and `text`. The Kafka key must
+  equal `sender_id`. Preserve the message ID through censorship and delivery.
+  An ID identifies the logical message; the field alone does not implement
+  deduplication of repeated submissions.
+- `User` contains `user_id`, which must equal its Kafka key. Repeating the same
+  entry does not create a second member.
+- `BlockCommand` contains `blocked_sender_id`, `recipient_id`, and an action:
+  `BLOCK` or `UNBLOCK`. The recipient is the user choosing whom to block.
+  `ACTION_UNSPECIFIED` is not a valid command. Repeated `BLOCK` and `UNBLOCK`
+  commands have set semantics: adding an existing member or removing an absent
+  member leaves the set unchanged. Use `UNBLOCK`, not a tombstone, to unblock.
+- `StopWord` contains one non-empty word. Normalize the entry by trimming
+  surrounding whitespace and lowercasing with `Locale.ROOT`; use the resulting
+  word as both key and value field. For example, an entry of `BAD` is stored
+  under `bad`. Censorship will apply the matching normalization to message words
+  while preserving the surrounding original text.
+- `DeliveryEnvelope` contains the message with censored text and distinct
+  `recipient_ids` excluding the sender. Its Kafka key remains the sender ID,
+  not a recipient ID. Initially, emit one envelope per message, including an
+  empty recipient list when nobody is eligible. No delivery consumer sends an
+  empty list to anyone, but the original message still counts in statistics.
+
+IDs are non-empty, case-sensitive strings. Fields duplicating Kafka keys make
+payloads self-contained; producers must keep them consistent. Protobuf describes
+the wire format but does not enforce these business rules. Runtime validation
+will be added alongside the processors that consume each model.
+
+### Partitioning checkpoint
+
+Trace the two related inputs:
+
+```text
+Alice blocks Bob:
+  topic: module2.chat.block-commands
+  key:   bob
+  value: blocked_sender_id: "bob" recipient_id: "alice" action: BLOCK
+
+Bob sends a message:
+  topic: module2.chat.messages
+  key:   bob
+  value: message_id: "m-1" sender_id: "bob" text: "This is BAD!"
+```
+
+Both keys serialize to the same bytes. With three partitions on both topics
+and the same default keyed partitioning, both records map to the same partition
+number in their respective topics. The topology must connect these inputs so
+Kafka Streams assigns the corresponding partitions and blocking state to the
+same task. Matching topic keys alone does not connect independent topologies.
+
+That task can maintain `blockedBy["bob"] = {"alice"}` and look it up locally for
+Bob's messages. His per-sender statistics can also be maintained in that task.
+The users and stop-word tables will be replicated to every Streams instance;
+their partition counts do not need to match the sender-partitioned inputs.
+
+After the block and the stop word `bad` are applied, with Alice, Bob, and Carol
+registered, the eventual delivery record is:
+
+```text
+topic: module2.chat.deliveries
+key:   bob
+value:
+  message { message_id: "m-1" sender_id: "bob" text: "This is ***!" }
+  recipient_ids: "carol"
+```
+
+This is the expected output once steps 4–6 are implemented. Equal partition
+numbers do not establish ordering between the message and block-command topics;
+the block must have been applied before processing the message for this example
+to hold. Do not explicitly choose different partitions for these related keys
+or change one input topic's partition count independently.
+
+### Verify the contracts
+
+With JDK 21 and Maven available, run from the repository root:
+
+```bash
+mvn -Dkotlin.compiler.daemon=false compile
+```
+
+This generates and compiles the Protobuf classes together with the application
+sources. No Kafka broker is needed for this check. The daemon flag runs the
+Kotlin compiler in the Maven process. Generated sources live under
+`target/generated-sources/protobuf`; edit the `.proto` definitions rather than
+those generated files.
+
 ## Implementation plan
 
 Work through one step at a time. Before each change, explain the decision and
@@ -127,7 +253,7 @@ progresses.
     **Checkpoint:** the Alice/Bob/Carol scenario above provides expected message
     text, recipients, and statistics to use throughout implementation.
 
-- [ ] **2. Define events, topics, and keys.**
+- [x] **2. Define events, topics, and keys.**
 
     Introduce message, user, block/unblock, stop-word, and delivery-envelope
     models using the existing Protobuf tooling. Key messages by `senderId`,

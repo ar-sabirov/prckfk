@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package chat.v1;
+
+option java_package = "module2.chat.proto";
+option java_multiple_files = true;
+option java_outer_classname = "ChatProtocol";
+
+// Input Kafka key: sender_id. The key and the payload ID must agree.
+message ChatMessage {
+  string message_id = 1;
+  string sender_id = 2;
+  string text = 3;
+}
+
+// Current membership, keyed by user_id. A Kafka tombstone removes the user.
+message User {
+  string user_id = 1;
+}
+
+// Keyed by blocked_sender_id so commands and that sender's messages can be
+// co-partitioned. This is a command, not a snapshot of all blocks for a sender.
+message BlockCommand {
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    BLOCK = 1;
+    UNBLOCK = 2;
+  }
+
+  string blocked_sender_id = 1;
+  string recipient_id = 2;
+  Action action = 3;
+}
+
+// Current stop-word entry. Both word and the Kafka key use the same normalized,
+// case-insensitive form. A Kafka tombstone removes the entry.
+message StopWord {
+  string word = 1;
+}
+
+// Output Kafka key: message.sender_id. message.text contains the censored text.
+// recipient_ids contains distinct eligible users and excludes the sender.
+message DeliveryEnvelope {
+  ChatMessage message = 1;
+  repeated string recipient_ids = 2;
+}
