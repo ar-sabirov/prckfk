@@ -38,6 +38,42 @@ services:
       retries: 12
       start_period: 15s
 
+  ksqldb:
+    image: confluentinc/cp-ksqldb-server:8.1.6
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18088:8088"
+    environment:
+      KSQL_BOOTSTRAP_SERVERS: kafka:29092
+      KSQL_LISTENERS: http://0.0.0.0:8088
+      KSQL_KSQL_SERVICE_ID: module2_
+      KSQL_KSQL_STREAMS_REPLICATION_FACTOR: "1"
+      KSQL_KSQL_INTERNAL_TOPIC_REPLICAS: "1"
+      KSQL_KSQL_SINK_REPLICAS: "1"
+      KSQL_HEAP_OPTS: "-Xms128m -Xmx512m"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8088/info"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 30s
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+      ksqldb:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:18080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: module2
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_KSQLDBSERVER: http://ksqldb:8088
+
   kafka-init:
     <<: *app
     command: ["module2.ChatTopicSetupKt"]

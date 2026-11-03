@@ -7,7 +7,9 @@ from other users. A global stop-word list controls censorship, and the applicati
 maintains global and per-sender statistics.
 
 There is no `groupId`: all registered users belong to the same chat. Censorship,
-recipient selection, blocking, and statistics run inside Kafka Streams.
+recipient selection, and blocking run in the Kotlin Kafka Streams application.
+Per-sender statistics run downstream in ksqlDB, consuming the final delivery
+decisions. Global statistics are planned in step 8.
 
 ## Chat behavior
 
@@ -56,9 +58,11 @@ confirm that processing tasks have applied it.
 ```text
 Message -> Censorship -> Recipient selection and blocking
                                       |
+                               Delivery topic
+                                      |
                          +------------+------------+
                          |                         |
-                  Delivery output              Statistics
+                  Delivery consumer        ksqlDB statistics
 ```
 
 Statistics use the final recipient selection. Count each chat message once,
@@ -116,9 +120,11 @@ Maven generates their Java classes in the `module2.proto` package for use
 from the JVM application. Topic names and partition counts are defined in
 [ChatTopics.kt](../../src/main/kotlin/module2/ChatTopics.kt).
 
-All Kafka keys are non-null UTF-8 strings, serialized with `StringSerializer`.
-Non-null values are Protobuf bytes. The examples below use Protobuf text format
-for readability; they are not JSON records or commands to run.
+The Kotlin application's Kafka keys are non-null UTF-8 strings, serialized with
+`StringSerializer`. Its non-null values are Protobuf bytes. The examples below
+use Protobuf text format for readability; they are not JSON records or commands
+to run. The downstream ksqlDB statistics use separate JSON topics, described
+in [Per-user statistics with SQL](#per-user-statistics-with-sql).
 
 ### Topic contracts
 
@@ -132,7 +138,8 @@ for readability; they are not JSON records or commands to run.
 
 The topic setup creates these topics and validates the partition counts and
 cleanup settings of existing topics. The models and constants themselves do not
-create topics. Statistics contracts will be added with steps 7 and 8.
+create topics. ksqlDB creates its own statistics and internal topics when the
+SQL queries are registered; `ChatTopicSetup` does not manage those topics.
 Three sender partitions are a small demonstration choice that allows work to be
 split across multiple tasks. This number is independent of the number of users;
 many senders can share one partition.
@@ -203,7 +210,8 @@ Kafka Streams assigns the corresponding partitions and blocking state to the
 same task. Matching topic keys alone does not connect independent topologies.
 
 That task can maintain `blockedBy["bob"] = {"alice"}` and look it up locally for
-Bob's messages. His per-sender statistics can also be maintained in that task.
+Bob's messages. With the switch to ksqlDB, statistics have their own processing tasks
+downstream of the delivery topic; the sender key is preserved for aggregation.
 The user registry and stop-word table are replicated to every Streams instance.
 Their partition counts do not need to match the sender-partitioned inputs.
 
@@ -238,7 +246,7 @@ Kotlin compiler in the Maven process. Generated sources live under
 `target/generated-sources/protobuf`; edit the `.proto` definitions rather than
 those generated files.
 
-## Running steps 4–6
+## Running steps 4–7
 
 The current topology censors messages, selects recipients from the user
 registry, and applies directional blocking:
@@ -260,7 +268,7 @@ delivery consumer still run as separate processes.
 The topology parses each `ChatMessage`, censors its text, and wraps it in a
 `DeliveryEnvelope`, preserving the sender key and message ID. Recipients are all
 currently registered users except the sender and those who have blocked that sender.
-Statistics follow in later steps.
+The ksqlDB queries below consume these envelopes for per-sender statistics.
 
 ### User registry and recipient selection
 
@@ -310,7 +318,9 @@ Application sources use package `module2` and live directly in
 | [ChatProducer.kt](../../src/main/kotlin/module2/ChatProducer.kt) | Continuously send sentences as Alice, Bob, and Stepan in round-robin order. |
 | [SentenceSource.kt](../../src/main/kotlin/module2/SentenceSource.kt) | Download plain text once and split it into sentences. |
 | [ChatConsumer.kt](../../src/main/kotlin/module2/ChatConsumer.kt) | Subscribe to deliveries, decode each envelope, and log its message and recipients. |
-| [docker-compose.yml](docker-compose.yml) | Run Kafka, a one-shot topic initializer, producer, Streams, and consumer services; provide an on-demand command runner. |
+| [docker-compose.yml](docker-compose.yml) | Run Kafka, Kafka UI, ksqlDB, a one-shot topic initializer, producer, Streams, and consumer services; provide an on-demand command runner. |
+| [per-user-statistics.sql](ksqldb/per-user-statistics.sql) | Register deliveries and continuously calculate per-sender message and exact unique-recipient counts. |
+| [per-user-statistics-test.sql](ksqldb/per-user-statistics-test.sql) | Verify repeated recipients, unblocking, independent senders, and empty recipient lists with the ksqlDB SQL test runner. |
 | [ChatTopologyTest.kt](../../src/test/kotlin/module2/ChatTopologyTest.kt) | Test membership, blocking, censorship, rule changes, topology connections, and validation without a broker. |
 | [CensorshipTest.kt](../../src/test/kotlin/module2/CensorshipTest.kt) | Test locale-independent normalization and rejection of invalid stop-word input. |
 | [ChatCommandsTest.kt](../../src/test/kotlin/module2/ChatCommandsTest.kt) | Test command records and validation without a broker. |
@@ -392,6 +402,186 @@ perform assertions. With the three demo users registered and no blocks, each
 message has the other two users as recipients. Configured stop words appear as
 `***` in the output text. On a fresh broker, messages initially have no recipients
 until registration is applied. Topic setup seeds neither users nor stop words.
+
+### Start ksqlDB and run SQL in Kafka UI
+
+The `ksqldb` service runs `confluentinc/cp-ksqldb-server:8.1.6` in interactive
+mode against `kafka:29092`. Kafka UI connects through
+`KAFKA_CLUSTERS_0_KSQLDBSERVER=http://ksqldb:8088` and waits for the server's
+health check. With the chat already running, start or update these services:
+
+```bash
+docker-compose up -d ksqldb kafka-ui
+docker-compose ps ksqldb kafka-ui
+```
+
+Open [Kafka UI](http://localhost:18080), select **module2**, open **KSQL DB**,
+and click **Execute KSQL Request**. Use its SQL editor to execute statements,
+starting with:
+
+```sql
+SHOW TOPICS;
+```
+
+This lists Kafka topics. `SHOW STREAMS;` and `SHOW TABLES;` list SQL objects,
+which are registered separately from the Kafka topics. The ksqlDB endpoint at
+[localhost:18088/info](http://localhost:18088/info) is a REST API; the browser
+SQL editor is provided by Kafka UI on port 18080.
+
+Declare a source stream over the existing delivery topic:
+
+```sql
+CREATE STREAM IF NOT EXISTS chat_deliveries (
+  sender_id STRING KEY,
+  message STRUCT<message_id STRING, sender_id STRING, text STRING>,
+  recipient_ids ARRAY<STRING>
+) WITH (
+  KAFKA_TOPIC='module2.chat.deliveries',
+  KEY_FORMAT='KAFKA',
+  VALUE_FORMAT='PROTOBUF_NOSR'
+);
+```
+
+The Kotlin application writes plain Protobuf bytes. `PROTOBUF_NOSR` uses an
+explicit SQL schema without Schema Registry. Keep the value fields and nested
+fields in the order of their Protobuf field numbers in `chat.proto`.
+`CREATE STREAM` registers how to read the existing topic; it does not start a
+statistics aggregation or rewrite its messages. To inspect three new deliveries
+while the producer is running:
+
+```sql
+SELECT sender_id, message->text AS text, recipient_ids
+FROM chat_deliveries
+EMIT CHANGES LIMIT 3;
+```
+
+This is a streaming query: it waits for matching records, then finishes at the
+limit. Persistent statistics use `CREATE TABLE ... AS SELECT` below.
+Count messages before expanding recipient arrays, so empty lists still
+count and multiple recipients do not multiply message counts. If delivery
+batching is added, introduce a separate event once per processed message for
+message counts. Replaying deliveries covers only records still retained in
+Kafka; it cannot reconstruct expired history.
+
+The stable service ID `module2_` identifies ksqlDB's command and internal topics.
+SQL definitions and persistent queries are stored in Kafka, and local query
+state can be rebuilt from Kafka after container recreation. Keep the broker's
+`kafka-data` volume to retain this history. Interactive mode deliberately has
+no `KSQL_KSQL_QUERIES_FILE`, which would select headless mode and disable
+interactive SQL. See Confluent's
+[Docker configuration](https://docs.confluent.io/platform/8.1/ksqldb/operate-and-deploy/installation/install-ksqldb-with-docker.html)
+and [serialization formats](https://docs.confluent.io/platform/current/ksqldb/reference/serialization.html#protobuf).
+
+Verified ksqlDB setup (2026-11-03): Compose configuration validated, ksqlDB 8.1.6
+reported `RUNNING`, and Kafka UI executed `SHOW TOPICS;`. The source declaration
+above succeeded, and the preview query returned three live deliveries with
+decoded sender IDs, message text, and recipient arrays.
+
+### Per-user statistics with SQL
+
+[ksqldb/per-user-statistics.sql](ksqldb/per-user-statistics.sql) implements step 7
+entirely in ksqlDB. It reads the existing Protobuf delivery envelopes and creates
+five persistent queries:
+
+| SQL object | Purpose | Kafka topic |
+| --- | --- | --- |
+| `CHAT_MESSAGE_COUNTS` | Count delivery envelopes by sender, including empty recipient lists. | `module2.chat.stats.message-counts` |
+| `CHAT_RECIPIENT_EVENTS` | Expand each recipient array with `EXPLODE`. | `module2.chat.stats.recipient-events` |
+| `CHAT_SENDER_RECIPIENTS` | Keep one table row per `(sender_id, recipient_id)` pair. | `module2.chat.stats.sender-recipients` |
+| `CHAT_RECIPIENT_COUNTS` | Count those table rows by sender. | `module2.chat.stats.recipient-counts` |
+| `CHAT_USER_STATISTICS` | Left join message and recipient counts, using zero when no recipient exists. | `module2.chat.user-statistics` |
+
+Run the setup **once**, from `assignments/module2`:
+
+```bash
+docker-compose exec -T ksqldb ksql http://localhost:8088 \
+  < ksqldb/per-user-statistics.sql
+```
+
+Alternatively, paste the `CREATE` statements into Kafka UI in file order. For
+each request, set **Stream properties** to key `auto.offset.reset`, value
+`earliest`. The file's `SET` statement configures a CLI session; do not rely on it
+carrying over between separate UI requests. `earliest` includes retained history
+when a query first starts. Changing it later does not rewind an existing query's
+committed offsets. SQL definitions persist across container restarts; inspect
+`SHOW TABLES;` and `SHOW QUERIES;` before rerunning setup.
+
+Read a current snapshot in Kafka UI:
+
+```sql
+SELECT * FROM CHAT_USER_STATISTICS;
+```
+
+Read one sender or watch subsequent updates:
+
+```sql
+SELECT * FROM CHAT_USER_STATISTICS WHERE SENDER_ID = 'bob';
+
+SELECT * FROM CHAT_USER_STATISTICS EMIT CHANGES LIMIT 10;
+```
+
+The columns are `SENDER_ID`, `MESSAGE_COUNT`, and `UNIQUE_RECIPIENT_COUNT`.
+A sender with no processed messages has no row yet (conceptually zero counts).
+A sender with messages but no eligible recipients has a row with recipient
+count zero. Fully censored messages still count normally.
+
+The distinct count is exact: another message to an existing recipient updates
+the pair's `SELECTION_COUNT` but does not add a table row. The next aggregation
+counts **table rows**, so that update does not increase the distinct count.
+Blocking or removing a recipient later does not delete a historical pair.
+`COUNT_DISTINCT` is approximate, and `COLLECT_SET` has a size limit; neither is
+used for this exact, uncapped count. See Confluent's
+[aggregate function reference](https://docs.confluent.io/platform/current/ksqldb/developer-guide/ksqldb-reference/aggregate-functions.html).
+
+Each SQL output topic has three partitions and JSON values. Keys use `KAFKA`
+(a plain sender string), except `CHAT_SENDER_RECIPIENTS`, whose composite key
+uses JSON. Table topics use compaction; the recipient event stream uses deletion.
+For example, the final topic can contain key `bob` with value
+`{"MESSAGE_COUNT":3,"UNIQUE_RECIPIENT_COUNT":2}`. These are replacement snapshots,
+so consumers must not sum successive values. The Kotlin delivery consumer
+continues reading only Protobuf deliveries; inspect JSON statistics through
+SQL or Kafka UI.
+
+ksqlDB owns separate Kafka Streams tasks and state stores. Message counting is
+grouped by the existing sender key; pair aggregation repartitions by the two
+fields, and recipient counting regroups the table by sender. The final join
+uses the sender key. Expanding arrays adds one event per selected recipient,
+and stored pair state grows with the number of distinct relationships. The
+two branches update independently, so the combined table can briefly show a
+new message count before its recipient count catches up.
+
+Counting assumes the current contract of one envelope per processed message.
+Application-level duplicate envelopes count again; deduplication by message ID
+and transactional recovery guarantees are not implemented here (see step 9).
+Future delivery batching must preserve a separate once-per-message input for
+the message-count query.
+
+To verify the SQL without writing test events to the running broker:
+
+```bash
+docker-compose run --rm --no-deps -v "$PWD/ksqldb:/sql:ro" \
+  --entrypoint /bin/bash ksqldb -c '
+    set -eu
+    mkdir -p /tmp/sql-tests
+    {
+      echo "--@test: Per-user statistics"
+      cat /sql/per-user-statistics.sql /sql/per-user-statistics-test.sql
+    } > /tmp/sql-tests/statistics.sql
+    run-ksql-test --test-directory /tmp/sql-tests \
+      --temp-folder /tmp/sql-test-state > /tmp/sql-test.log 2>&1
+    cat /tmp/sql-test.log
+    grep -q "Test passed!" /tmp/sql-test.log
+    ! grep -q "Test failed" /tmp/sql-test.log
+  '
+```
+
+Verified on 2026-11-03 with ksqlDB 8.1.6: the SQL test passes Bob's `2/1` then
+`3/2` checkpoint, independent Stepan counts, fully censored text, an initially
+empty recipient list, and preservation of historical reach after an empty
+delivery. All five live queries were created, and the combined table returned
+sender/message/recipient rows. The pre-existing local message-count query was
+preserved and counts from its original start; the new recipient branch replayed
+retained deliveries. A fresh setup using the file starts both from `earliest`.
 
 ### Change membership while the demo runs
 
@@ -634,7 +824,8 @@ docker-compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
   and recovery verification are part of step 9.
 
 The demo now illustrates transport, censorship, recipient selection, and blocking.
-The full Alice/Bob/Stepan scenario gains its counters as statistics are implemented.
+The SQL test above verifies the scenario's per-sender counters; global counters
+remain part of step 8.
 The producer supplies message text; all business processing runs in the Streams
 application.
 
@@ -769,24 +960,25 @@ progresses.
     punctuation, repeated matches, a word inside a longer word, and a message
     whose entire text becomes `***`.
 
-- [ ] **7. Add per-sender statistics.**
+- [x] **7. Add per-sender statistics with ksqlDB.**
 
-    Maintain each sender's message count and historical set of distinct
-    recipients. Publish statistics as keyed updates. Count the original message
-    once regardless of the number of recipient batches. Explain why the stores
-    fit naturally beside sender-keyed processing.
+    Aggregate delivery decisions into each sender's message count and an exact
+    table of historical sender-recipient pairs. Publish statistics as keyed
+    updates. Count the original message once regardless of recipient fan-out
+    or future delivery batches. Explain how ksqlDB maintains its own state and
+    tasks using the sender-keyed output of the Kotlin application.
 
     **Checkpoint:** Bob sends twice to Stepan: two messages and one unique
     recipient. After Alice unblocks Bob, another message brings Bob's totals to
     three messages and two unique recipients.
 
-- [ ] **8. Add global statistics.**
+- [ ] **8. Add global statistics with ksqlDB.**
 
-    Count chat messages once globally. For unique recipients, emit newly
-    encountered sender-recipient relationships and deduplicate by recipient in
-    a separate aggregation. Inspect the required repartitioning and its cost:
-    first-seen events add some fan-out, but repeated messages to the same
-    recipients do not repeat it.
+    Count chat messages once globally. Deduplicate historical recipient
+    relationships by recipient in a separate table and count its rows for
+    exact global uniqueness. Do not use approximate `COUNT_DISTINCT` for this
+    contract. Inspect the required repartitioning and the cost of expanding
+    recipient arrays, including repeated messages to the same recipients.
 
     **Checkpoint:** Bob and Stepan both target Alice, but Alice contributes only
     once to the global unique-recipient count. Verify the complete scenario's
