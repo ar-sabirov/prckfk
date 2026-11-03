@@ -130,7 +130,7 @@ for readability; they are not JSON records or commands to run.
 | `module2.chat.stop-words` | Normalized `word` | `StopWord`, or a tombstone to remove the word | 1 | `compact` |
 | `module2.chat.deliveries` | `message.sender_id` | `DeliveryEnvelope` | 3 | `delete` |
 
-The step-3 setup creates these topics and validates the partition counts and
+The topic setup creates these topics and validates the partition counts and
 cleanup settings of existing topics. The models and constants themselves do not
 create topics. Statistics contracts will be added with steps 7 and 8.
 Three sender partitions are a small demonstration choice that allows work to be
@@ -202,8 +202,9 @@ same task. Matching topic keys alone does not connect independent topologies.
 
 That task can maintain `blockedBy["bob"] = {"alice"}` and look it up locally for
 Bob's messages. His per-sender statistics can also be maintained in that task.
-The users and stop-word tables will be replicated to every Streams instance;
-their partition counts do not need to match the sender-partitioned inputs.
+The user registry is replicated to every Streams instance; the stop-word table
+will follow in step 6. Their partition counts do not need to match the
+sender-partitioned inputs.
 
 After the block and the stop word `bad` are applied, with Alice, Bob, and Stepan
 registered, the eventual delivery record is:
@@ -236,20 +237,47 @@ Kotlin compiler in the Maven process. Generated sources live under
 `target/generated-sources/protobuf`; edit the `.proto` definitions rather than
 those generated files.
 
-## Running step 3
+## Running step 4
 
-The current topology is a stateless message-to-envelope mapping:
+The current topology selects recipients from the user registry:
 
 ```text
+module2.chat.users -> GlobalKTable (local copy on each Streams instance)
+                                      |
 producer -> module2.chat.messages -> chat (Kafka Streams) -> module2.chat.deliveries -> consumer
 ```
 
 It parses each `ChatMessage` and wraps it in a `DeliveryEnvelope`, preserving
-the sender key and the message fields. The envelope's recipient list is empty
-at this step because recipient selection has not been implemented yet. Step 4
-will populate that list. Blocking, censorship, and statistics follow in later
-steps. The users and stop-word topics exist, but there are no `GlobalKTable`s or
-application state stores yet.
+the sender key and the message fields. The recipients are all currently
+registered users except the sender. Blocking, censorship, and statistics follow
+in later steps; the stop-word topic is not consumed yet.
+
+### User registry and recipient selection
+
+`ChatTopology` materializes `module2.chat.users` as a `GlobalKTable` in the local
+store named `chat-users`. Every Streams instance consumes all partitions of the
+user topic and maintains its own complete copy. This lets any message task
+select recipients locally, regardless of which sender partitions it owns.
+
+`RecipientSelectionProcessor` reads that store for each message, excludes the
+sender, and forwards one envelope. A normal table join looks up a value for one
+key; recipient selection needs to enumerate the membership instead. The fixed-key
+processor keeps the sender key, so this operation requires no repartitioning.
+
+Registering the same ID again replaces its entry; it does not create a duplicate
+recipient. A tombstone removes the entry. A user can receive messages without
+having sent any. An empty registry, or one containing only the sender, still
+produces one envelope with `recipients=[]`. Recipient order is not a contract.
+
+Selection scans the registry and includes the recipient IDs in the envelope, so
+its work and output size grow with membership. It avoids producing a separate
+Kafka record per recipient; it does not eliminate the cost of listing recipients.
+
+Message processing validates non-empty message IDs and keys, equality between
+the sender ID and key, and non-empty user IDs matching their registry keys.
+Protobuf payloads must be valid. Invalid input fails processing rather than
+silently generating an incorrect delivery; user payloads are checked when the
+processor reads the registry.
 
 ### Files and responsibilities
 
@@ -258,14 +286,16 @@ Application sources use package `module2` and live directly in
 
 | File | Responsibility |
 | --- | --- |
-| [ChatTopology.kt](../../src/main/kotlin/module2/ChatTopology.kt) | Build the topology that wraps messages in delivery envelopes without starting clients or contacting Kafka. |
+| [ChatTopology.kt](../../src/main/kotlin/module2/ChatTopology.kt) | Build the global user table and connect message input, recipient selection, and delivery output. |
+| [RecipientSelectionProcessor.kt](../../src/main/kotlin/module2/RecipientSelectionProcessor.kt) | Read local membership, exclude the sender, and emit one delivery envelope. |
 | [ChatConfig.kt](../../src/main/kotlin/module2/ChatConfig.kt) | Configure the broker connection, application ID, stream thread, offsets, and state directory. |
 | [ChatApplication.kt](../../src/main/kotlin/module2/ChatApplication.kt) | Print the topology, start Kafka Streams, report state transitions, and close on shutdown. |
-| [ChatTopicSetup.kt](../../src/main/kotlin/module2/ChatTopicSetup.kt) | Create missing topics and check existing topics against the contracts. |
+| [ChatTopicSetup.kt](../../src/main/kotlin/module2/ChatTopicSetup.kt) | Create and check topics, then seed demo users; accept `add`/`remove` commands for membership changes. |
 | [ChatProducer.kt](../../src/main/kotlin/module2/ChatProducer.kt) | Continuously send sentences as Alice, Bob, and Stepan in round-robin order. |
 | [SentenceSource.kt](../../src/main/kotlin/module2/SentenceSource.kt) | Download plain text once and split it into sentences. |
 | [ChatConsumer.kt](../../src/main/kotlin/module2/ChatConsumer.kt) | Subscribe to deliveries, decode each envelope, and log its message and recipients. |
-| [docker-compose.yml](docker-compose.yml) | Run a Kafka 4.1.0 broker, topic setup, and separate producer, Streams, and consumer processes. |
+| [docker-compose.yml](docker-compose.yml) | Run Kafka, topic and user setup, and separate producer, Streams, and consumer processes. |
+| [ChatTopologyTest.kt](../../src/test/kotlin/module2/ChatTopologyTest.kt) | Test membership changes, recipient selection, and validation without a broker. |
 
 The local broker uses KRaft with broker and controller roles in one process and
 replication factor 1. It exposes `localhost:19092` for host clients; containers
@@ -284,9 +314,14 @@ docker-compose logs --tail=50 kafka-init chat
 docker-compose logs -f --tail=10 producer consumer
 ```
 
-The broker must become healthy, `kafka-init` must exit with code 0, and `chat`
-must reach `RUNNING`. The `producer` and `consumer` services keep running until
-stopped. Each uses its own Kafka client; neither runs inside the Streams process.
+The broker must become healthy; `kafka-init` creates and checks the topics, then
+registers Alice, Bob, and Stepan and exits with code 0. Only then does `chat`
+start. Kafka Streams restores the global user table before starting message
+processing, so the demo's initial membership is available without an arbitrary
+sleep. `chat` must reach `RUNNING`.
+
+The `producer` and `consumer` services keep running until stopped. Each uses its
+own Kafka client; neither runs inside the Streams process.
 The producer can start sending while Streams is joining its consumer group;
 Kafka retains those messages until Streams processes them. After a restart,
 group rebalancing may delay the first output.
@@ -294,13 +329,50 @@ The logs have this form (text abbreviated here):
 
 ```text
 Produced topic=module2.chat.messages partition=<n> offset=<input-offset> key=alice messageId=<id> text="..."
-Consumed topic=module2.chat.deliveries partition=<n> offset=<output-offset> key=alice messageId=<id> recipients=[] text="..."
+Consumed topic=module2.chat.deliveries partition=<n> offset=<output-offset> key=alice messageId=<id> recipients=[bob, stepan] text="..."
 ```
 
 Compare the same `messageId` in both logs to see its journey through the app.
 The consumer prints every record; it does not filter for a particular ID or
-perform assertions. Text is unchanged at this step, and `recipients=[]` is
-expected until step 4. Censorship starts in step 6.
+perform assertions. With the three demo users registered, each message has the
+other two users as recipients. Text is unchanged at this step. Censorship starts
+in step 6.
+
+### Change membership while the demo runs
+
+Run these commands from `assignments/module2`:
+
+```bash
+docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt remove stepan
+docker-compose logs -f --tail=10 consumer
+```
+
+Once the tombstone has been applied, Bob's messages target only Alice. The
+producer continues cycling through its three sender IDs; membership controls
+recipient selection. Restore Stepan with:
+
+```bash
+docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt add stepan
+```
+
+You can also register a user who never sends a message, then remove them:
+
+```bash
+docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt add dana
+docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt remove dana
+```
+
+The command waits for Kafka to acknowledge the update. The global table consumes
+updates asynchronously, so that acknowledgement does not mean every Streams
+instance has applied it yet. Observe subsequent delivery logs to see the change.
+Membership changes do not emit deliveries or modify earlier envelopes. Tests
+apply user updates before the corresponding messages explicitly.
+
+Running `ChatTopicSetupKt` without arguments creates/checks topics and registers
+the three demo users. The `add` and `remove` commands only update the specified
+users; they do not run the default setup. Each Compose startup that runs
+`kafka-init` re-registers the demo users. Other memberships persist in the
+compacted topic until removed with tombstones.
 
 ### Sentence source and sender rotation
 
@@ -368,9 +440,10 @@ docker-compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
 - **Application ID:** `module2-chat` identifies this Streams application and its
   consumer group. Instances with the same ID share the work and committed input
   offsets. Changing the ID starts an independent application.
-- **Tasks:** the single source has three partitions, producing three tasks for
+- **Tasks:** the message input has three partitions, producing three tasks for
   this topology. One configured stream thread handles those tasks; three tasks
-  do not mean three application processes or three threads.
+  do not mean three application processes or three threads. A separate global
+  thread maintains the complete user registry for the instance.
 - **Partition and order:** each sender's key selects an input partition. The
   unchanged key and matching output partition count select the same partition
   number for the delivery envelope. Different senders can share a partition.
@@ -386,18 +459,31 @@ docker-compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
   A failure can cause an input to be processed again. Transactional processing
   and recovery verification are part of step 9.
 
-The demo illustrates transport. The full Alice/Bob/Stepan scenario becomes
-runnable as the subsequent processing stages are implemented. The producer
-supplies message text; recipient selection, blocking, censorship, and statistics
-remain responsibilities of the Streams application.
+The demo now illustrates transport and recipient selection. The full
+Alice/Bob/Stepan scenario becomes runnable as blocking, censorship, and statistics
+are implemented. The producer supplies message text; all business processing
+runs in the Streams application.
 
-Verified checkpoint (2026-11-03): a clean local compile and the Docker image's
-Maven `verify` build passed. The producer loaded 18,217 non-empty pieces from
-the gist using the period split. A live check matched nine messages from Alice,
-Bob, and Stepan to decoded envelopes in `module2.chat.deliveries`, preserving
-message IDs, keys, partition numbers, and text, with empty recipient lists.
-Alice and Bob shared partition 0; Stepan used partition 1. There is no unit test
-suite at this step yet.
+### Test recipient selection
+
+From the repository root, with JDK 21 and Maven available:
+
+```bash
+mvn -Dkotlin.compiler.daemon=false test
+```
+
+The JUnit tests use Kafka's `TopologyTestDriver` with the real topology and
+Protobuf records. They cover exclusion of the sender, exactly one envelope per
+message, joining users, repeated registrations, tombstones and re-registration,
+empty recipient lists, preserved message fields, and invalid IDs or keys.
+The driver applies global-table input synchronously; the live demo has the
+asynchronous update timing described above.
+
+Verified checkpoint (2026-11-03): all seven topology tests passed locally and
+in the Docker image's Maven `verify` build. The live demo restored the three
+seeded users and selected the other two users for each sender. After publishing
+Stepan's tombstone, Bob's recipient list changed from `[alice, stepan]` to
+`[alice]`. Re-registering Stepan restores the original membership.
 
 Stop the module-2 services with:
 
@@ -449,7 +535,7 @@ progresses.
     partition, and output. Explain `application.id`, tasks, and offsets using
     this run.
 
-- [ ] **4. Add users and recipient selection.**
+- [x] **4. Add users and recipient selection.**
 
     Maintain the shared user registry in replicated local state. Calculate
     recipients for each message, exclude the sender, and populate the delivery

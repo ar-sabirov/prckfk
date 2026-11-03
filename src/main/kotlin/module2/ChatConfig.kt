@@ -2,6 +2,7 @@ package module2
 
 import org.apache.kafka.clients.CommonClientConfigs
 import org.apache.kafka.clients.consumer.ConsumerConfig
+import org.apache.kafka.clients.producer.ProducerConfig
 import org.apache.kafka.streams.StreamsConfig
 import java.util.Properties
 
@@ -11,6 +12,14 @@ object ChatConfig {
             CommonClientConfigs.BOOTSTRAP_SERVERS_CONFIG,
             System.getenv("KAFKA_BOOTSTRAP_SERVERS") ?: "localhost:19092",
         )
+    }
+
+    fun producerProperties(): Properties = clientProperties().apply {
+        setProperty(ProducerConfig.ACKS_CONFIG, "all")
+        setProperty(ProducerConfig.ENABLE_IDEMPOTENCE_CONFIG, "true")
+        setProperty(ProducerConfig.MAX_BLOCK_MS_CONFIG, "30000")
+        setProperty(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, "30000")
+        setProperty(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, "10000")
     }
 
     fun streamsProperties(): Properties = clientProperties().apply {

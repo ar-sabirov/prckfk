@@ -1,10 +1,15 @@
 package module2
 
+import module2.proto.User
 import org.apache.kafka.clients.admin.AdminClient
 import org.apache.kafka.clients.admin.AdminClientConfig
 import org.apache.kafka.clients.admin.NewTopic
+import org.apache.kafka.clients.producer.KafkaProducer
+import org.apache.kafka.clients.producer.ProducerRecord
 import org.apache.kafka.common.config.ConfigResource
 import org.apache.kafka.common.config.TopicConfig
+import org.apache.kafka.common.serialization.ByteArraySerializer
+import org.apache.kafka.common.serialization.StringSerializer
 import java.util.concurrent.TimeUnit
 
 private data class TopicSpec(
@@ -13,7 +18,22 @@ private data class TopicSpec(
     val config: Map<String, String> = mapOf(TopicConfig.CLEANUP_POLICY_CONFIG to "delete"),
 )
 
-fun main() {
+fun main(args: Array<String>) {
+    if (args.isEmpty()) {
+        createTopics()
+        updateUsers("add", listOf("alice", "bob", "stepan"))
+        return
+    }
+
+    require(args.size >= 2 && args[0] in setOf("add", "remove")) {
+        "Usage: module2.ChatTopicSetupKt [<add|remove> <user-id> ...]"
+    }
+    val userIds = args.drop(1)
+    require(userIds.all { it.isNotEmpty() }) { "User IDs must not be empty" }
+    updateUsers(args[0], userIds)
+}
+
+private fun createTopics() {
     val compacted = mapOf(TopicConfig.CLEANUP_POLICY_CONFIG to "compact")
     val topics = listOf(
         TopicSpec(ChatTopics.MESSAGES, ChatTopics.SENDER_PARTITIONS),
@@ -53,6 +73,16 @@ fun main() {
                 check(actual == expected) { "${spec.name}: expected $key=$expected, found $actual" }
             }
             println("Ready topic=${spec.name} partitions=$actualPartitions config=${spec.config}")
+        }
+    }
+}
+
+private fun updateUsers(action: String, userIds: List<String>) {
+    KafkaProducer(ChatConfig.producerProperties(), StringSerializer(), ByteArraySerializer()).use { producer ->
+        for (userId in userIds) {
+            val value = if (action == "add") User.newBuilder().setUserId(userId).build().toByteArray() else null
+            val metadata = producer.send(ProducerRecord(ChatTopics.USERS, userId, value)).get(30, TimeUnit.SECONDS)
+            println("Published user $action key=$userId topic=${metadata.topic()} offset=${metadata.offset()}")
         }
     }
 }
