@@ -1,4 +1,4 @@
-package module2.chat
+package module2
 
 object ChatTopics {
     const val MESSAGES = "module2.chat.messages"

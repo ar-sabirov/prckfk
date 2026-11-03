@@ -87,34 +87,34 @@ counts.
 
 ## Example scenario
 
-Register Alice, Bob, and Carol. Configure `bad` as a stop word and have Alice
+Register Alice, Bob, and Stepan. Configure `bad` as a stop word and have Alice
 block Bob. Apply these updates before processing the following messages.
 
 | Step | Action | Delivered text | Eligible recipients | Global messages | Global unique recipients |
 | --- | --- | --- | --- | --- | --- |
-| 1 | Bob sends `This is BAD!` | `This is ***!` | Carol | 1 | 1 |
-| 2 | Bob sends `Hello again` | `Hello again` | Carol | 2 | 1 |
-| 3 | Carol sends `Hello` | `Hello` | Alice, Bob | 3 | 3 |
+| 1 | Bob sends `This is BAD!` | `This is ***!` | Stepan | 1 | 1 |
+| 2 | Bob sends `Hello again` | `Hello again` | Stepan | 2 | 1 |
+| 3 | Stepan sends `Hello` | `Hello` | Alice, Bob | 3 | 3 |
 | 4 | Alice unblocks Bob; apply the update | — | — | 3 | 3 |
-| 5 | Bob sends `bad badge` | `*** badge` | Alice, Carol | 4 | 3 |
+| 5 | Bob sends `bad badge` | `*** badge` | Alice, Stepan | 4 | 3 |
 
 Final per-user statistics:
 
 | Sender | Messages | Unique recipients | Recipients reached |
 | --- | --- | --- | --- |
 | Alice | 0 | 0 | None |
-| Bob | 3 | 2 | Alice, Carol |
-| Carol | 1 | 2 | Alice, Bob |
+| Bob | 3 | 2 | Alice, Stepan |
+| Stepan | 1 | 2 | Alice, Bob |
 
-Bob and Carol each reached two distinct recipients, but the global unique
+Bob and Stepan each reached two distinct recipients, but the global unique
 recipient count is three because Alice appears in both sets.
 
 ## Events, topics, and keys
 
 The wire models are defined in [chat.proto](../../src/main/proto/chat.proto).
-Maven generates their Java classes in the `module2.chat.proto` package for use
+Maven generates their Java classes in the `module2.proto` package for use
 from the JVM application. Topic names and partition counts are defined in
-[ChatTopics.kt](../../src/main/kotlin/module2/chat/ChatTopics.kt).
+[ChatTopics.kt](../../src/main/kotlin/module2/ChatTopics.kt).
 
 All Kafka keys are non-null UTF-8 strings, serialized with `StringSerializer`.
 Non-null values are Protobuf bytes. The examples below use Protobuf text format
@@ -130,14 +130,15 @@ for readability; they are not JSON records or commands to run.
 | `module2.chat.stop-words` | Normalized `word` | `StopWord`, or a tombstone to remove the word | 1 | `compact` |
 | `module2.chat.deliveries` | `message.sender_id` | `DeliveryEnvelope` | 3 | `delete` |
 
-These are the contracts for topic creation in step 3; no topics are created by
-the models or constants. Statistics contracts will be added with steps 7 and 8.
+The step-3 setup creates these topics and validates the partition counts and
+cleanup settings of existing topics. The models and constants themselves do not
+create topics. Statistics contracts will be added with steps 7 and 8.
 Three sender partitions are a small demonstration choice that allows work to be
 split across multiple tasks. This number is independent of the number of users;
 many senders can share one partition.
 
 Messages and block commands are event logs. In particular, do not compact block
-commands by sender ID: Alice's block of Bob and Carol's block of Bob are separate
+commands by sender ID: Alice's block of Bob and Stepan's block of Bob are separate
 commands with the same key. Keeping only the latest command would lose part of
 the blocking state when rebuilding it. The application will aggregate commands
 into its inverse blocking index in step 5.
@@ -204,7 +205,7 @@ Bob's messages. His per-sender statistics can also be maintained in that task.
 The users and stop-word tables will be replicated to every Streams instance;
 their partition counts do not need to match the sender-partitioned inputs.
 
-After the block and the stop word `bad` are applied, with Alice, Bob, and Carol
+After the block and the stop word `bad` are applied, with Alice, Bob, and Stepan
 registered, the eventual delivery record is:
 
 ```text
@@ -212,7 +213,7 @@ topic: module2.chat.deliveries
 key:   bob
 value:
   message { message_id: "m-1" sender_id: "bob" text: "This is ***!" }
-  recipient_ids: "carol"
+  recipient_ids: "stepan"
 ```
 
 This is the expected output once steps 4–6 are implemented. Equal partition
@@ -235,6 +236,177 @@ Kotlin compiler in the Maven process. Generated sources live under
 `target/generated-sources/protobuf`; edit the `.proto` definitions rather than
 those generated files.
 
+## Running step 3
+
+The current topology is a stateless message-to-envelope mapping:
+
+```text
+producer -> module2.chat.messages -> chat (Kafka Streams) -> module2.chat.deliveries -> consumer
+```
+
+It parses each `ChatMessage` and wraps it in a `DeliveryEnvelope`, preserving
+the sender key and the message fields. The envelope's recipient list is empty
+at this step because recipient selection has not been implemented yet. Step 4
+will populate that list. Blocking, censorship, and statistics follow in later
+steps. The users and stop-word topics exist, but there are no `GlobalKTable`s or
+application state stores yet.
+
+### Files and responsibilities
+
+Application sources use package `module2` and live directly in
+`src/main/kotlin/module2`. Generated Protobuf classes use `module2.proto`.
+
+| File | Responsibility |
+| --- | --- |
+| [ChatTopology.kt](../../src/main/kotlin/module2/ChatTopology.kt) | Build the topology that wraps messages in delivery envelopes without starting clients or contacting Kafka. |
+| [ChatConfig.kt](../../src/main/kotlin/module2/ChatConfig.kt) | Configure the broker connection, application ID, stream thread, offsets, and state directory. |
+| [ChatApplication.kt](../../src/main/kotlin/module2/ChatApplication.kt) | Print the topology, start Kafka Streams, report state transitions, and close on shutdown. |
+| [ChatTopicSetup.kt](../../src/main/kotlin/module2/ChatTopicSetup.kt) | Create missing topics and check existing topics against the contracts. |
+| [ChatProducer.kt](../../src/main/kotlin/module2/ChatProducer.kt) | Continuously send sentences as Alice, Bob, and Stepan in round-robin order. |
+| [SentenceSource.kt](../../src/main/kotlin/module2/SentenceSource.kt) | Download plain text once and split it into sentences. |
+| [ChatConsumer.kt](../../src/main/kotlin/module2/ChatConsumer.kt) | Subscribe to deliveries, decode each envelope, and log its message and recipients. |
+| [docker-compose.yml](docker-compose.yml) | Run a Kafka 4.1.0 broker, topic setup, and separate producer, Streams, and consumer processes. |
+
+The local broker uses KRaft with broker and controller roles in one process and
+replication factor 1. It exposes `localhost:19092` for host clients; containers
+connect to `kafka:29092`. Port 19092 keeps this exercise separate from module 1's
+host ports. The application reuses the repository's Maven/JDK 21 Docker build.
+
+### Start and verify
+
+Start your container runtime first (`colima start` if using Colima). Run these
+commands from `assignments/module2`:
+
+```bash
+docker-compose up --build -d
+docker-compose ps -a
+docker-compose logs --tail=50 kafka-init chat
+docker-compose logs -f --tail=10 producer consumer
+```
+
+The broker must become healthy, `kafka-init` must exit with code 0, and `chat`
+must reach `RUNNING`. The `producer` and `consumer` services keep running until
+stopped. Each uses its own Kafka client; neither runs inside the Streams process.
+The producer can start sending while Streams is joining its consumer group;
+Kafka retains those messages until Streams processes them. After a restart,
+group rebalancing may delay the first output.
+The logs have this form (text abbreviated here):
+
+```text
+Produced topic=module2.chat.messages partition=<n> offset=<input-offset> key=alice messageId=<id> text="..."
+Consumed topic=module2.chat.deliveries partition=<n> offset=<output-offset> key=alice messageId=<id> recipients=[] text="..."
+```
+
+Compare the same `messageId` in both logs to see its journey through the app.
+The consumer prints every record; it does not filter for a particular ID or
+perform assertions. Text is unchanged at this step, and `recipients=[]` is
+expected until step 4. Censorship starts in step 6.
+
+### Sentence source and sender rotation
+
+The default source is the Russian text of *War and Peace* from
+[this gist](https://gist.github.com/romaklimenko/c95f3a864828f7f034b7a33d1676e420).
+The producer downloads its raw UTF-8 text once on startup, then splits it on the
+literal `.` character:
+
+```kotlin
+text.split('.')
+    .map { it.trim() }
+    .filter { it.isNotEmpty() }
+```
+
+Each non-empty piece becomes a message, without the separating period. Only
+surrounding whitespace is removed; headings and internal line breaks remain.
+`!` and `?` do not split messages, and periods in abbreviations do. This simple
+rule is sufficient for the demo.
+
+The producer sends one sentence at a time with a fresh UUID, using sender IDs
+`alice`, `bob`, and `stepan` in that order, then repeats the sender rotation.
+The Kafka key equals the message's `sender_id`. After each acknowledged send,
+it waits one second by default. At the end of the sentence list it loops back
+to the beginning, continuing the sender rotation independently. Restarting the
+producer downloads the source again and starts from Alice and the first sentence.
+
+The source must be reachable from the producer container. HTTP failures or an
+empty sentence list stop the producer with an error. To use another UTF-8
+plain-text URL or change the interval, set these Compose environment variables:
+
+```bash
+SENTENCE_SOURCE_URL=https://gist.githubusercontent.com/romaklimenko/c95f3a864828f7f034b7a33d1676e420/raw/warandpeace.txt \
+PRODUCER_INTERVAL_MS=2000 docker-compose up -d producer
+```
+
+Pause and resume message generation independently of processing and logging:
+
+```bash
+docker-compose stop producer
+docker-compose start producer
+```
+
+### Consumer offsets
+
+The logger subscribes to `module2.chat.deliveries` with its own consumer group,
+`module2-chat-logger`. It uses `auto.offset.reset=earliest`: on its first run,
+with no committed offsets, it reads all retained output records. That also
+covers records produced before the consumer finishes starting.
+
+It auto-commits offsets every second while polling. On later runs, it resumes
+from committed offsets. There are no `seek` calls or manual partition
+assignments. A crash can cause some records to be logged again; this logger
+does not promise exactly-once console output. Its offsets are independent of
+the Streams application's input offsets.
+
+### What to inspect
+
+```bash
+docker-compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 --describe --topic module2.chat.messages
+docker-compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server kafka:29092 --describe --group module2-chat
+```
+
+- **Application ID:** `module2-chat` identifies this Streams application and its
+  consumer group. Instances with the same ID share the work and committed input
+  offsets. Changing the ID starts an independent application.
+- **Tasks:** the single source has three partitions, producing three tasks for
+  this topology. One configured stream thread handles those tasks; three tasks
+  do not mean three application processes or three threads.
+- **Partition and order:** each sender's key selects an input partition. The
+  unchanged key and matching output partition count select the same partition
+  number for the delivery envelope. Different senders can share a partition.
+  Round-robin order describes the producer's sends; the consumer can interleave
+  partitions differently. Kafka preserves order within each partition.
+- **Offsets:** each topic-partition has its own sequence. Input and output
+  offsets need not match even when their partition numbers do. The consumer-group
+  report shows the application's committed input positions, not output offsets.
+- **Restart position:** `earliest` applies only when no valid committed offset
+  exists. Otherwise the application resumes from its committed position. The
+  one-second commit interval makes progress visible during the exercise.
+- **Processing guarantee:** this step uses the default at-least-once behavior.
+  A failure can cause an input to be processed again. Transactional processing
+  and recovery verification are part of step 9.
+
+The demo illustrates transport. The full Alice/Bob/Stepan scenario becomes
+runnable as the subsequent processing stages are implemented. The producer
+supplies message text; recipient selection, blocking, censorship, and statistics
+remain responsibilities of the Streams application.
+
+Verified checkpoint (2026-11-03): a clean local compile and the Docker image's
+Maven `verify` build passed. The producer loaded 18,217 non-empty pieces from
+the gist using the period split. A live check matched nine messages from Alice,
+Bob, and Stepan to decoded envelopes in `module2.chat.deliveries`, preserving
+message IDs, keys, partition numbers, and text, with empty recipient lists.
+Alice and Bob shared partition 0; Stepan used partition 1. There is no unit test
+suite at this step yet.
+
+Stop the module-2 services with:
+
+```bash
+docker-compose down
+```
+
+Broker data and the application's state directory remain in named volumes.
+
 ## Implementation plan
 
 Work through one step at a time. Before each change, explain the decision and
@@ -250,7 +422,7 @@ progresses.
     recipients still count and that recipient counts describe delivery
     decisions, not client acknowledgements.
 
-    **Checkpoint:** the Alice/Bob/Carol scenario above provides expected message
+    **Checkpoint:** the Alice/Bob/Stepan scenario above provides expected message
     text, recipients, and statistics to use throughout implementation.
 
 - [x] **2. Define events, topics, and keys.**
@@ -264,12 +436,14 @@ progresses.
     **Checkpoint:** trace "Alice blocks Bob" and "Bob sends hello" through their
     topic keys and explain where the related state will live.
 
-- [ ] **3. Run the smallest Kafka Streams application.**
+- [x] **3. Run the smallest Kafka Streams application.**
 
     Add module-2 startup configuration, topic creation, and a topology that reads
-    a message and writes it unchanged. Reuse the existing Maven/JVM setup. Keep
-    topology construction separate from application startup so processing can
-    be tested without a broker.
+    a message and wraps it in a delivery envelope with an empty recipient list.
+    Preserve the message fields and sender key. Reuse the existing Maven/JVM
+    setup. Keep topology construction separate from application startup so
+    processing can be tested without a broker. Run the sentence producer and
+    output logger as separate Compose services.
 
     **Checkpoint:** send one known message and inspect its key, value,
     partition, and output. Explain `application.id`, tasks, and offsets using
@@ -278,11 +452,11 @@ progresses.
 - [ ] **4. Add users and recipient selection.**
 
     Maintain the shared user registry in replicated local state. Calculate
-    recipients for each message, exclude the sender, and emit an envelope
-    containing the message and recipient IDs.
+    recipients for each message, exclude the sender, and populate the delivery
+    envelope's recipient IDs.
 
-    **Checkpoint:** with Alice, Bob, and Carol registered, Bob's message targets
-    Alice and Carol. Explain how the envelope avoids a separate message record
+    **Checkpoint:** with Alice, Bob, and Stepan registered, Bob's message targets
+    Alice and Stepan. Explain how the envelope avoids a separate message record
     for every recipient.
 
 - [ ] **5. Implement blocking.**
@@ -294,7 +468,7 @@ progresses.
     do not establish a single ordering.
 
     **Checkpoint:** after Alice's block of Bob is applied, Bob's next message
-    targets Carol. Carol's messages still target Alice and Bob. Unblocking
+    targets Stepan. Stepan's messages still target Alice and Bob. Unblocking
     restores Alice's eligibility for Bob's subsequent messages.
 
 - [ ] **6. Add global censorship.**
@@ -315,7 +489,7 @@ progresses.
     once regardless of the number of recipient batches. Explain why the stores
     fit naturally beside sender-keyed processing.
 
-    **Checkpoint:** Bob sends twice to Carol: two messages and one unique
+    **Checkpoint:** Bob sends twice to Stepan: two messages and one unique
     recipient. After Alice unblocks Bob, another message brings Bob's totals to
     three messages and two unique recipients.
 
@@ -327,7 +501,7 @@ progresses.
     first-seen events add some fan-out, but repeated messages to the same
     recipients do not repeat it.
 
-    **Checkpoint:** Bob and Carol both target Alice, but Alice contributes only
+    **Checkpoint:** Bob and Stepan both target Alice, but Alice contributes only
     once to the global unique-recipient count. Verify the complete scenario's
     totals without summing per-sender unique counts.
 
