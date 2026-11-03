@@ -65,8 +65,8 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-      ksqldb:
-        condition: service_healthy
+      ksqldb-init:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:18080:8080"
     environment:
@@ -81,6 +81,41 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+
+  demo-init:
+    <<: *app
+    entrypoint: ["/bin/sh", "/demo/init.sh"]
+    restart: "no"
+    volumes:
+      - ./demo/init.sh:/demo/init.sh:ro
+      - demo-state:/var/lib/chat-demo
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+
+  ksqldb-init:
+    image: confluentinc/cp-ksqldb-server:8.1.6
+    entrypoint: ["ksql"]
+    command: ["http://ksqldb:8088", "--file", "/sql/ksqldb-queries.sql"]
+    restart: "no"
+    volumes:
+      - ./ksqldb:/sql:ro
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      ksqldb:
+        condition: service_healthy
+
+  ksqldb-check:
+    image: confluentinc/cp-ksqldb-server:8.1.6
+    profiles: ["tools"]
+    entrypoint: ["ksql"]
+    command: ["http://ksqldb:8088", "--file", "/sql/test-queries.sql"]
+    volumes:
+      - ./ksqldb:/sql:ro
+    depends_on:
+      ksqldb-init:
+        condition: service_completed_successfully
 
   commands:
     <<: *app
@@ -105,19 +140,10 @@ services:
     volumes:
       - chat-state:/var/lib/chat-streams
     depends_on:
-      kafka-init:
+      demo-init:
         condition: service_completed_successfully
-
-  producer:
-    <<: *app
-    command: ["-Dorg.slf4j.simpleLogger.defaultLogLevel=warn", "module2.ChatProducerKt"]
-    environment:
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      SENTENCE_SOURCE_URL: "${SENTENCE_SOURCE_URL:-https://gist.githubusercontent.com/romaklimenko/c95f3a864828f7f034b7a33d1676e420/raw/warandpeace.txt}"
-      PRODUCER_INTERVAL_MS: "${PRODUCER_INTERVAL_MS:-1000}"
-    depends_on:
-      chat:
-        condition: service_started
+      ksqldb-init:
+        condition: service_completed_successfully
 
   consumer:
     <<: *app
@@ -132,3 +158,4 @@ services:
 volumes:
   kafka-data:
   chat-state:
+  demo-state:

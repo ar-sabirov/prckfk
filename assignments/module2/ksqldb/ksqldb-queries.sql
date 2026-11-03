@@ -1,27 +1,11 @@
--- Run this file in the ksqlDB CLI. In Kafka UI, run the CREATE statements in
--- order and set the stream property auto.offset.reset=earliest for each request.
+-- Executed automatically by the ksqldb-init Compose service.
+-- For manual execution, run this file in the ksqlDB CLI. In Kafka UI, run the
+-- CREATE statements in order with stream property auto.offset.reset=earliest.
 -- IF NOT EXISTS permits adding missing queries to an existing installation;
 -- it does not replace existing definitions or reset their history.
 SET 'auto.offset.reset' = 'earliest';
 
--- Raw input required by TASK.md. Value columns follow ChatMessage field numbers
--- 1, 2, 3. PAYLOAD_SENDER_ID distinguishes field 2 from the Kafka key SENDER_ID.
--- This registers the current group-chat schema; it does not add recipient_id
--- or a timestamp payload field. ROWTIME exposes the Kafka record timestamp.
-CREATE STREAM IF NOT EXISTS MESSAGES_STREAM (
-    SENDER_ID STRING KEY,
-    MESSAGE_ID STRING,
-    PAYLOAD_SENDER_ID STRING,
-    TEXT STRING
-) WITH (
-    KAFKA_TOPIC='messages',
-    KEY_FORMAT='KAFKA',
-    VALUE_FORMAT='PROTOBUF_NOSR',
-    PARTITIONS=3
-);
-
--- Existing analytics describe final delivery decisions, not requested recipients
--- in raw input. Keep this source distinct from MESSAGES_STREAM.
+-- Analytics consume censored messages with final recipient lists after blocking.
 CREATE STREAM IF NOT EXISTS FILTERED_MESSAGES_STREAM (
     SENDER_ID STRING KEY,
     MESSAGE STRUCT<MESSAGE_ID STRING, SENDER_ID STRING, TEXT STRING>,

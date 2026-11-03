@@ -33,13 +33,15 @@ class BlockCommandProcessor : FixedKeyProcessor<String, ByteArray, Void> {
             BlockCommand.Action.BLOCK -> recipients.add(command.recipientId)
             else -> recipients.remove(command.recipientId)
         }
-        if (!changed) return
-
-        if (recipients.isEmpty()) {
-            blockedBy.delete(key)
-        } else {
-            blockedBy.put(key, BlockedRecipients.newBuilder().addAllRecipientIds(recipients).build().toByteArray())
+        if (changed) {
+            if (recipients.isEmpty()) {
+                blockedBy.delete(key)
+            } else {
+                blockedBy.put(key, BlockedRecipients.newBuilder().addAllRecipientIds(recipients).build().toByteArray())
+            }
         }
+        // A broker acknowledgement alone cannot confirm that this task applied a command.
+        println("Applied ${command.action} recipient=${command.recipientId} sender=$key")
         // Commands update local state only; they never produce delivery records.
     }
 }

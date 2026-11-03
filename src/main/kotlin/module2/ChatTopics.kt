@@ -1,7 +1,6 @@
 package module2
 
 object ChatTopics {
-    // Public topic names follow assignments/module2/TASK.md.
     const val MESSAGES = "messages"
     const val USERS = "users"
     // An event log of block/unblock commands, not a compacted block snapshot.

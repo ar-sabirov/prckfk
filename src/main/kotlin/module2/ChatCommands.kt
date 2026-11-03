@@ -1,6 +1,7 @@
 package module2
 
 import module2.proto.BlockCommand
+import module2.proto.ChatMessage
 import module2.proto.StopWord
 import module2.proto.User
 import org.apache.kafka.clients.producer.KafkaProducer
@@ -18,6 +19,7 @@ val CHAT_COMMAND_HELP = """
       unblock <recipient-id> <sender-id>
       add-stop-word <word> ...
       remove-stop-word <word> ...
+      send <sender-id> <message-id> <text>
       help
     Quote arguments containing spaces in your shell.
     Kafka acknowledgement does not mean Streams has applied the update yet.
@@ -43,6 +45,17 @@ class ChatCommands(
         val values = args.drop(1)
         // Validate the whole command before publishing any of its records.
         val records: List<ProducerRecord<String, ByteArray>> = when (action) {
+            "send" -> {
+                require(values.size == 3 && values[0].isNotEmpty() && values[1].isNotEmpty()) {
+                    "Usage: send <sender-id> <message-id> <text>"
+                }
+                val message = ChatMessage.newBuilder()
+                    .setSenderId(values[0])
+                    .setMessageId(values[1])
+                    .setText(values[2])
+                    .build()
+                listOf(ProducerRecord(ChatTopics.MESSAGES, message.senderId, message.toByteArray()))
+            }
             "add", "remove" -> {
                 require(values.isNotEmpty() && values.all { it.isNotEmpty() }) { "Usage: $action <user-id> ..." }
                 values.map { userId ->
@@ -72,8 +85,9 @@ class ChatCommands(
         }
         for (record in records) {
             val metadata = producer.send(record).get(30, TimeUnit.SECONDS)
+            val messageInfo = if (action == "send") " messageId=${values[1]}" else ""
             output(
-                "Published $action key=${record.key()} topic=${metadata.topic()} " +
+                "Published $action key=${record.key()}$messageInfo topic=${metadata.topic()} " +
                     "partition=${metadata.partition()} offset=${metadata.offset()}",
             )
         }

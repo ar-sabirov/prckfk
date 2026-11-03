@@ -1,1158 +1,186 @@
-# Module 2: Kafka Streams chat
+# Kafka, модуль 2: блокировки, цензура и статистика
 
-## Goal
+## Как решено задание
 
-Implement one shared group chat using Kafka Streams. Users can block messages
-from other users. A global stop-word list controls censorship, and the application
-maintains global and per-sender statistics.
+Исходная формулировка трактована как групповой чат, в котором пользователи могут
+скрывать сообщения конкретных пользователей. Таким образом получатели сообщения
+вычисляются при обработке и зависят от всех зарегистрированных пользователей и
+блокировок.
+Поэтому источник аналитики — `FILTERED_MESSAGES_STREAM` над `filtered_messages`.
+Он содержит выбранных получателей с учётом блокировок; `MESSAGES_STREAM` не создаётся.
 
-There is no `groupId`: all registered users belong to the same chat. Censorship,
-recipient selection, and blocking run in the Kotlin Kafka Streams application.
-Statistics run downstream in ksqlDB, consuming the final delivery decisions.
-Global totals aggregate the per-sender tables and historical recipient pairs.
+- Если Alice блокирует Bob, она перестаёт получать его сообщения; остальные
+  получатели не меняются.
+- Общий список запрещённых слов обновляется на ходу. Цензура заменяет целые слова
+  на `***` без учёта регистра, сохраняя пунктуацию: `BAD!` → `***!`, `badge` → `badge`.
+- В `filtered_messages` записывается один `DeliveryEnvelope`: обработанный текст
+  и список допустимых получателей. Демонстрационный consumer выводит его в лог.
+- ksqlDB считает сообщения и уникальных получателей по отправителям и глобально.
+  Сообщение учитывается один раз, даже с пустым списком получателей; повторные
+  сообщения тому же получателю не увеличивают число уникальных получателей.
 
-## Evaluation against TASK.md (2026-11-03)
+Модели — [chat.proto](../../src/main/proto/chat.proto)
 
-[TASK.md](TASK.md) is the assignment specification. Task 1's processing behavior
-is implemented, and optional Task 2's statistics are implemented. The existing Protobuf
-models and shared group-chat behavior are retained by agreement: the example
-`user_id`, `recipient_id`, `message`, `timestamp` schema is not mandatory.
+## Запуск
 
-| Requirement | Status and evidence |
-| --- | --- |
-| Separate persistent blocking state for each user | Implemented as the equivalent inverse index: `blocked sender -> recipients who blocked them`. `BlockCommandProcessor` updates a persistent RocksDB store with Kafka changelog logging; `blocked_users` retains the command history. A live restart/recovery checkpoint remains unverified. |
-| Blocked messages do not reach the blocking recipient | Implemented in `RecipientSelectionProcessor`, including directional blocks, unblocking, and multiple blockers. Other eligible recipients still receive a delivery instruction. The demo consumer logs these instructions; it is not a client messaging service. |
-| Dynamically updated censorship before delivery | Implemented with the replicated `stop_words` table and `CensorshipProcessor`. Tests cover adds, tombstones, case, punctuation, Unicode, and whole-word matching. |
-| Docker Compose and required chat topics | Implemented. Public names now match the assignment: `messages`, `filtered_messages`, `blocked_users`. Additional `users` and `stop_words` topics support the group chat. |
-| Class descriptions, launch instructions, test data | Documented below, with an example scenario, topology tests, and commands for changing users and rules. Exact chat texts are exercised through `TopologyTestDriver`; the live producer uses downloaded sentences. A reproducible full broker scenario is still step 10. |
-| ksqlDB source stream `messages_stream` | Registered over raw `messages` in `ksqldb/ksqldb-queries.sql`. The current analytics deliberately use the separate `FILTERED_MESSAGES_STREAM` over final delivery decisions. |
-| Total message count across all users | Implemented in `GLOBAL_MESSAGE_COUNTS` by summing current `USER_MESSAGE_COUNTS` table rows. Replacing a sender's total replaces their contribution; it does not add the full total again. |
-| Unique recipient count across all users | Implemented in `GLOBAL_RECIPIENT_COUNTS` by counting rows of `GLOBAL_RECIPIENTS`, keyed only by recipient. Users reached by multiple senders count once. |
-| Per-user message and unique-recipient counts, stored for queries | Implemented in `USER_STATISTICS`, backed by `user_statistics`. Messages with empty recipient lists still count; repeated sender-recipient pairs do not increase uniqueness. |
-| SQL file and test queries | `ksqldb/ksqldb-queries.sql` contains both source declarations and all per-user/global queries. Verification queries for message counts and unique-recipient counts are below. |
+Нужны Docker с Compose. Для Docker VM желательно хотя бы 4 GiB памяти.
+Все команды ниже выполняются из `assignments/module2`.
+Сценарий рассчитан на пустые топики и состояние. Для повторения на учебном стенде:
+`docker-compose down -v --remove-orphans`
 
-Counts describe processed chat messages and eligible recipients, not client
-acknowledgements. There is currently one output envelope per processed message.
-The Streams application uses at-least-once processing, so replay after a failure
-can overcount messages; `message_id` alone does not deduplicate them. This limits
-the counting guarantee and is tracked in step 9. Exactly-once processing and
-multi-instance demonstrations are extensions in this README's plan, not explicit
-requirements in TASK.md.
-
-The naming cleanup changes topics, SQL objects, and the SQL setup filename;
-it does not change Protobuf fields or recipient selection. SQL helper names use
-`USER_` for sender aggregates so they cannot be mistaken for global counters.
-Unquoted ksqlDB identifiers are shown in uppercase: `USER_STATISTICS` is the
-assignment's `user_statistics` table; its Kafka topic is lowercase.
-Application IDs, processor names, and local `chat-*` store names are internal
-identifiers, not additional public topics.
-
-Development verification (2026-11-03): Docker's Maven `verify` build
-passed all 54 JVM tests (43 topology, 7 censorship, 4 command tests). The ksqlDB
-8.1.6 checks passed the per-user, global, and initially empty-recipient scenarios.
-Compose configuration also validated. These checks did not verify live restart
-recovery, multiple instances, or migration of the existing broker's data.
-
-### Existing installations after the rename
-
-The previous topics used `module2.chat.*`, the SQL source was `CHAT_DELIVERIES`,
-and the final table was `CHAT_USER_STATISTICS`. These are persistent Kafka/ksqlDB
-resources: editing source files does not rename or migrate them. Do not mix new
-topic names with old Streams state or old SQL queries. The running old-name demo
-was inspected during this review; its five queries were running, but its message
-counter started at a different point from the recipient branch, as recorded in
-the earlier checkpoint below.
-
-For a fresh exercise run, stop the old project, then use a new Compose project
-with separate broker and Streams volumes. From `assignments/module2`:
+Запуск инфраструктуры, приложения и аналитики одной командой:
 
 ```bash
-docker-compose -p kafka-module2 down
-export COMPOSE_PROJECT_NAME=kafka-module2-task-names
 docker-compose up --build -d
 ```
 
-Keep `COMPOSE_PROJECT_NAME` set in every shell used for the commands below, then
-register users/rules and run the renamed SQL setup. The old project's volumes
-remain available; no historical data is copied into the new project. Restoring
-the old demo requires its matching code and project name. A history-preserving
-migration is separate work. The source update itself does not restart the live
-stack or execute this migration.
+Compose выполняет подготовку автоматически:
 
-## Chat behavior
-
-### Recipients and blocking
-
-- A message targets all registered users except its sender.
-- Blocking is directional: if Alice blocks Bob, Alice does not receive Bob's
-  messages. Bob can still receive Alice's messages.
-- Blocking affects only the user who created the block. Other eligible users
-  still receive the message.
-- Unblocking restores eligibility for subsequent messages.
-
-The output is a delivery instruction containing the message and its eligible
-recipient IDs. The current implementation emits one envelope per message;
-batching is not implemented. The demo delivery consumer logs those instructions
-without evaluating blocking or censorship again.
-
-### Censorship
-
-Replace each whole-word occurrence of a configured stop word with exactly `***`.
-Matching is case-insensitive; surrounding text and punctuation remain unchanged.
-The same stop-word list applies to every user.
-
-For example, with `bad` configured as a stop word:
-
-| Original text | Censored text |
-| --- | --- |
-| `This is BAD!` | `This is ***!` |
-| `bad, really bad!` | `***, really ***!` |
-| `badge` | `badge` |
-| `bad` | `***` |
-
-Censorship transforms the text; it does not reject the message. A message whose
-entire text becomes `***` remains eligible for delivery and counts normally in
-statistics. Use the term **censorship** in code, for example
-`CensorshipProcessor` or `censor(text, stopWords)`.
-
-### Rule updates
-
-A message uses the rule state available when it is processed. Updates affect
-subsequent processing; they do not retract earlier delivery instructions or
-recalculate historical statistics. Publishing an update does not by itself
-confirm that processing tasks have applied it.
-
-## Processing flow
-
-```text
-Message -> Censorship -> Recipient selection and blocking
-                                      |
-                               Delivery topic
-                                      |
-                         +------------+------------+
-                         |                         |
-                  Delivery consumer        ksqlDB statistics
-```
-
-Statistics use the final recipient selection. Count each chat message once,
-regardless of its number of recipients or masked words. Future batching must
-preserve this counting rule. A message with no eligible recipients still
-contributes one to the message count.
-
-## Statistics
-
-Per-user statistics describe the user as a **sender**. Recipient counts describe
-users selected for delivery, not acknowledgements that clients received the
-message. All statistics are cumulative over the retained application history.
-
-| Metric | Definition |
-| --- | --- |
-| Global message count | Number of processed chat messages, counted once per message. |
-| Global unique recipient count | Number of distinct users selected for at least one message from any sender. |
-| Per-user message count | Number of processed chat messages sent by that user. |
-| Per-user unique recipient count | Number of distinct users selected for at least one message from that sender. |
-
-Unique recipient counts are exact. Repeated messages to the same recipient do
-not increase the corresponding unique count. Global uniqueness is calculated
-across all senders; it is not the sum of their individual unique counts.
-Blocking or unblocking someone does not remove them from historical recipient
-counts. User and rule updates are not chat messages and do not increase message
-counts.
-
-## Example scenario
-
-Register Alice, Bob, and Stepan. Configure `bad` as a stop word and have Alice
-block Bob. Apply these updates before processing the following messages.
-
-| Step | Action | Delivered text | Eligible recipients | Global messages | Global unique recipients |
-| --- | --- | --- | --- | --- | --- |
-| 1 | Bob sends `This is BAD!` | `This is ***!` | Stepan | 1 | 1 |
-| 2 | Bob sends `Hello again` | `Hello again` | Stepan | 2 | 1 |
-| 3 | Stepan sends `Hello` | `Hello` | Alice, Bob | 3 | 3 |
-| 4 | Alice unblocks Bob; apply the update | — | — | 3 | 3 |
-| 5 | Bob sends `bad badge` | `*** badge` | Alice, Stepan | 4 | 3 |
-
-Final per-user statistics:
-
-| Sender | Messages | Unique recipients | Recipients reached |
-| --- | --- | --- | --- |
-| Alice | 0 | 0 | None |
-| Bob | 3 | 2 | Alice, Stepan |
-| Stepan | 1 | 2 | Alice, Bob |
-
-Bob and Stepan each reached two distinct recipients, but the global unique
-recipient count is three because Alice appears in both sets.
-
-## Events, topics, and keys
-
-The wire models are defined in [chat.proto](../../src/main/proto/chat.proto).
-Maven generates their Java classes in the `module2.proto` package for use
-from the JVM application. Topic names and partition counts are defined in
-[ChatTopics.kt](../../src/main/kotlin/module2/ChatTopics.kt).
-
-The Kotlin application's Kafka keys are non-null UTF-8 strings, serialized with
-`StringSerializer`. Its non-null values are Protobuf bytes. The examples below
-use Protobuf text format for readability; they are not JSON records or commands
-to run. The downstream ksqlDB statistics use separate JSON topics, described
-in [Statistics with SQL](#statistics-with-sql).
-
-### Topic contracts
-
-| Topic | Key | Value | Partitions | Cleanup policy |
-| --- | --- | --- | --- | --- |
-| `messages` | `sender_id` | `ChatMessage` | 3 | `delete` |
-| `users` | `user_id` | `User`, or a tombstone to remove membership | 1 | `compact` |
-| `blocked_users` | `blocked_sender_id` | `BlockCommand` | 3 | `delete`; retain the command history for this exercise (`retention.ms=-1`) |
-| `stop_words` | Normalized `word` | `StopWord`, or a tombstone to remove the word | 1 | `compact` |
-| `filtered_messages` | `message.sender_id` | `DeliveryEnvelope` | 3 | `delete` |
-
-The topic setup creates these topics and validates the partition counts and
-cleanup settings of existing topics. The models and constants themselves do not
-create topics. ksqlDB creates its own statistics and internal topics when the
-SQL queries are registered; `ChatTopicSetup` does not manage those topics.
-Three sender partitions are a small demonstration choice that allows work to be
-split across multiple tasks. This number is independent of the number of users;
-many senders can share one partition.
-
-Messages and block commands are event logs. In particular, do not compact block
-commands by sender ID: Alice's block of Bob and Stepan's block of Bob are separate
-commands with the same key. Keeping only the latest command would lose part of
-the blocking state when rebuilding it. The application aggregates commands into
-its inverse blocking index in step 5.
-
-Users and stop words describe current state. A non-null record creates or
-replaces the entry for its key. A tombstone is a Kafka record with a key and a
-null value; it deletes that entry. It is not an empty Protobuf message or the
-string `"null"`. Compaction can discard superseded values while retaining the
-state needed by a table. Removing a user does not erase historical statistics.
-
-### Model rules
-
-- `ChatMessage` contains `message_id`, `sender_id`, and `text`. The Kafka key must
-  equal `sender_id`. Preserve the message ID through censorship and delivery.
-  An ID identifies the logical message; the field alone does not implement
-  deduplication of repeated submissions.
-- `User` contains `user_id`, which must equal its Kafka key. Repeating the same
-  entry does not create a second member.
-- `BlockCommand` contains `blocked_sender_id`, `recipient_id`, and an action:
-  `BLOCK` or `UNBLOCK`. The recipient is the user choosing whom to block.
-  `ACTION_UNSPECIFIED` is not a valid command. Repeated `BLOCK` and `UNBLOCK`
-  commands have set semantics: adding an existing member or removing an absent
-  member leaves the set unchanged. Use `UNBLOCK`, not a tombstone, to unblock.
-- `StopWord` contains one non-empty word. Normalize the entry by trimming
-  surrounding whitespace and lowercasing with `Locale.ROOT`; use the resulting
-  word as both key and value field. For example, an entry of `BAD` is stored
-  under `bad`. Censorship will apply the matching normalization to message words
-  while preserving the surrounding original text. A word is a contiguous run
-  of Unicode letters, combining marks, numbers, or underscores. Punctuation
-  and whitespace separate words; phrases and punctuation are not valid entries.
-- `DeliveryEnvelope` contains the message with censored text and distinct
-  `recipient_ids` excluding the sender. Its Kafka key remains the sender ID,
-  not a recipient ID. Emit one envelope per message, including an
-  empty recipient list when nobody is eligible. No delivery consumer sends an
-  empty list to anyone, but the original message still counts in statistics.
-
-IDs are non-empty, case-sensitive strings. Fields duplicating Kafka keys make
-payloads self-contained; producers must keep them consistent. Protobuf describes
-the wire format but does not enforce these business rules. Processors validate
-messages and commands while processing them, and table entries when reading
-them for a message.
-
-### Partitioning checkpoint
-
-Trace the two related inputs:
-
-```text
-Alice blocks Bob:
-  topic: blocked_users
-  key:   bob
-  value: blocked_sender_id: "bob" recipient_id: "alice" action: BLOCK
-
-Bob sends a message:
-  topic: messages
-  key:   bob
-  value: message_id: "m-1" sender_id: "bob" text: "This is BAD!"
-```
-
-Both keys serialize to the same bytes. With three partitions on both topics
-and the same default keyed partitioning, both records map to the same partition
-number in their respective topics. The topology must connect these inputs so
-Kafka Streams assigns the corresponding partitions and blocking state to the
-same task. Matching topic keys alone does not connect independent topologies.
-
-That task can maintain `blockedBy["bob"] = {"alice"}` and look it up locally for
-Bob's messages. With the switch to ksqlDB, statistics have their own processing tasks
-downstream of the delivery topic; the sender key is preserved for aggregation.
-The user registry and stop-word table are replicated to every Streams instance.
-Their partition counts do not need to match the sender-partitioned inputs.
-
-After the block and the stop word `bad` are applied, with Alice, Bob, and Stepan
-registered, the eventual delivery record is:
-
-```text
-topic: filtered_messages
-key:   bob
-value:
-  message { message_id: "m-1" sender_id: "bob" text: "This is ***!" }
-  recipient_ids: "stepan"
-```
-
-This is the expected output with steps 4–6 implemented. Equal partition
-numbers do not establish ordering between the message and block-command topics;
-the block must have been applied before processing the message for this example
-to hold. Do not explicitly choose different partitions for these related keys
-or change one input topic's partition count independently.
-
-### Verify the contracts
-
-With JDK 21 and Maven available, run from the repository root:
+- `kafka-init` создаёт топики;
+- `demo-init` добавляет Alice, Bob, Степана, стоп-слово `bad` и блокировку Alice → Bob;
+- `ksqldb-init` выполняет [ksqldb-queries.sql](ksqldb/ksqldb-queries.sql) после готовности Kafka и ksqlDB;
+- `chat` стартует после подготовки данных и SQL, затем запускается `consumer`.
 
 ```bash
-mvn -Dkotlin.compiler.daemon=false compile
-```
-
-This generates and compiles the Protobuf classes together with the application
-sources. No Kafka broker is needed for this check. The daemon flag runs the
-Kotlin compiler in the Maven process. Generated sources live under
-`target/generated-sources/protobuf`; edit the `.proto` definitions rather than
-those generated files.
-
-## Running steps 4–8
-
-The current topology censors messages, selects recipients from the user
-registry, and applies directional blocking:
-
-```text
-messages -> CensorshipProcessor -> RecipientSelectionProcessor -> filtered_messages
-                    ^                       ^             ^
-             chat-stop-words           chat-users    chat-blocked-by
-              (global table)         (global table)   (task-local store)
-                    ^                       ^             ^
-                stop_words                users     BlockCommandProcessor
-                                                          ^
-                                                     blocked_users
-```
-
-The `chat-*` names in the diagram are local state stores; the other data-source
-names are Kafka topics. The producer and delivery consumer run as separate
-processes.
-
-The topology parses each `ChatMessage`, censors its text, and wraps it in a
-`DeliveryEnvelope`, preserving the sender key and message ID. Recipients are all
-currently registered users except the sender and those who have blocked that sender.
-The ksqlDB queries below consume these envelopes for per-sender and global statistics.
-
-### User registry and recipient selection
-
-`ChatTopology` materializes `users` as a `GlobalKTable` in the local
-store named `chat-users`. Every Streams instance consumes all partitions of the
-user topic and maintains its own complete copy. This lets any message task
-select recipients locally, regardless of which sender partitions it owns.
-
-`RecipientSelectionProcessor` reads that store for each message, excludes the
-sender and blocked recipients, and forwards one envelope. A normal table join
-looks up a value for one key; recipient selection needs to enumerate the
-membership instead. The fixed-key processor keeps the sender key, so this
-operation requires no repartitioning.
-
-Registering the same ID again replaces its entry; it does not create a duplicate
-recipient. A tombstone removes the entry. A user can receive messages without
-having sent any. An empty registry, or one containing only the sender, still
-produces one envelope with `recipients=[]`, as does a message blocked by every
-other member. Recipient order is not a contract.
-
-Selection scans the registry and includes the recipient IDs in the envelope, so
-its work and output size grow with membership. It avoids producing a separate
-Kafka record per recipient; it does not eliminate the cost of listing recipients.
-
-Message processing validates non-empty message IDs and keys, equality between
-the sender ID and key, and non-empty user IDs matching their registry keys.
-Protobuf payloads must be valid. Invalid input fails processing rather than
-silently generating an incorrect delivery; user payloads are checked when the
-processor reads the registry.
-
-### Files and responsibilities
-
-Application sources use package `module2` and live directly in
-`src/main/kotlin/module2`. Generated Protobuf classes use `module2.proto`.
-
-| File | Responsibility |
-| --- | --- |
-| [ChatTopology.kt](../../src/main/kotlin/module2/ChatTopology.kt) | Build the global user and stop-word tables, place censorship before recipient selection, and connect both sender-keyed inputs to the blocking store. |
-| [CensorshipProcessor.kt](../../src/main/kotlin/module2/CensorshipProcessor.kt) | Read and validate global stop-word state and transform each message's text. |
-| [Censorship.kt](../../src/main/kotlin/module2/Censorship.kt) | Normalize stop-word entries and replace matching whole words while preserving separators. |
-| [BlockCommandProcessor.kt](../../src/main/kotlin/module2/BlockCommandProcessor.kt) | Validate block/unblock commands and maintain the inverse blocking index. |
-| [RecipientSelectionProcessor.kt](../../src/main/kotlin/module2/RecipientSelectionProcessor.kt) | Read membership and blocking state, exclude ineligible recipients, and emit one delivery envelope. |
-| [ChatConfig.kt](../../src/main/kotlin/module2/ChatConfig.kt) | Configure the broker connection, application ID, stream thread, offsets, and state directory. |
-| [ChatApplication.kt](../../src/main/kotlin/module2/ChatApplication.kt) | Print the topology, start Kafka Streams, report state transitions, and close on shutdown. |
-| [ChatTopicSetup.kt](../../src/main/kotlin/module2/ChatTopicSetup.kt) | Create and validate topics, then exit. |
-| [ChatCommands.kt](../../src/main/kotlin/module2/ChatCommands.kt) | Run one command from process arguments, publish membership/blocking/stop-word updates, and exit. |
-| [ChatProducer.kt](../../src/main/kotlin/module2/ChatProducer.kt) | Continuously send sentences as Alice, Bob, and Stepan in round-robin order. |
-| [SentenceSource.kt](../../src/main/kotlin/module2/SentenceSource.kt) | Download plain text once and split it into sentences. |
-| [ChatConsumer.kt](../../src/main/kotlin/module2/ChatConsumer.kt) | Subscribe to deliveries, decode each envelope, and log its message and recipients. |
-| [docker-compose.yml](docker-compose.yml) | Run Kafka, Kafka UI, ksqlDB, a one-shot topic initializer, producer, Streams, and consumer services; provide an on-demand command runner. |
-| [ksqldb-queries.sql](ksqldb/ksqldb-queries.sql) | Register raw input and filtered output streams; continuously calculate per-sender and global message and exact unique-recipient counts. |
-| [ChatTopologyTest.kt](../../src/test/kotlin/module2/ChatTopologyTest.kt) | Test membership, blocking, censorship, rule changes, topology connections, and validation without a broker. |
-| [CensorshipTest.kt](../../src/test/kotlin/module2/CensorshipTest.kt) | Test locale-independent normalization and rejection of invalid stop-word input. |
-| [ChatCommandsTest.kt](../../src/test/kotlin/module2/ChatCommandsTest.kt) | Test command records and validation without a broker. |
-
-The local broker uses KRaft with broker and controller roles in one process and
-replication factor 1. It exposes `localhost:19092` for host clients; containers
-connect to `kafka:29092`. Port 19092 keeps this exercise separate from module 1's
-host ports. The application reuses the repository's Maven/JDK 21 Docker build.
-
-### Start and verify
-
-Start your container runtime first (`colima start` if using Colima). Run these
-commands from `assignments/module2`:
-
-If upgrading an existing old-name demo, first follow
-[Existing installations after the rename](#existing-installations-after-the-rename).
-
-```bash
-docker-compose up --build -d
 docker-compose ps -a
-docker-compose logs --tail=50 kafka-init chat
+docker-compose logs --tail=50 demo-init ksqldb-init chat
 ```
 
-The broker must become healthy; `kafka-init` creates and checks the topics, then
-exits with code 0. `chat` depends on its successful completion.
-`kafka-init` has no restart loop and publishes no users or rules. It is a
-one-shot job, not an exactly-once-ever operation: Compose may run it again on
-later startups or recreation. Repeating it safely validates existing topics.
-See Docker's [startup dependency conditions](https://docs.docker.com/compose/how-tos/startup-order/).
+`kafka` и `ksqldb` должны стать `healthy`, три init-сервиса — завершиться с кодом 0.
+Перед отправкой сообщений на чистом стенде дождитесь в логах `chat` состояния
+`RUNNING` и строки `Applied BLOCK recipient=Alice sender=Bob`. Пользователи и
+стоп-слова уже заданы, поэтому глобальные таблицы восстановятся до обработки сообщений.
 
-Kafka Streams restores the global user and stop-word tables before message
-processing. Retained membership and rules therefore survive startup; `chat`
-must reach `RUNNING`. On a fresh broker, register the demo users with:
+[Kafka UI](http://localhost:18080) позволяет смотреть топики и выполнять SQL.
+`demo-init` отмечает первый успешный запуск в томе `demo-state`, поэтому повторный
+`up` не возвращает отменённые блокировки. SQL-объекты также сохраняются;
+`ksqldb-init` добавляет отсутствующие, но не меняет существующие определения.
+Сообщения автоматически не генерируются: ниже приведён конечный тестовый сценарий.
+
+## Что делает код
+
+Основные файлы — [src/main/kotlin/module2](../../src/main/kotlin/module2):
+
+- `ChatApplication.kt`, `ChatConfig.kt` — запуск и настройки Streams;
+  `ChatTopicSetup.kt`, `ChatTopics.kt` — создание и проверка топиков.
+- `ChatTopology.kt` — цепочка `messages → цензура → выбор получателей → filtered_messages`.
+  Справочники `users` и `stop_words` доступны каждому экземпляру через глобальные таблицы.
+- `BlockCommandProcessor.kt` — читает команды из `blocked_users` и обновляет
+  обратный индекс блокировок `blockedBy` (подробнее ниже).
+- `CensorshipProcessor.kt`, `Censorship.kt` — маскируют запрещённые слова;
+  `RecipientSelectionProcessor.kt` исключает отправителя и заблокировавших его пользователей.
+- `ChatCommands.kt` — отправляет заданное сообщение командой
+  `send <sender-id> <message-id> <text>` и публикует изменения участников и правил.
+  Удаление пользователя или слова — запись с `null` в соответствующий справочник.
+- `ChatConsumer.kt` — читает результат и печатает ID, текст и получателей.
+
+SQL строит статистику по `FILTERED_MESSAGES_STREAM`: сообщениям после цензуры
+и выбора получателей с учётом блокировок. Уникальность вычисляется
+по таблице пар «отправитель — получатель», глобально — по отдельной таблице получателей.
+Итоговые таблицы и топики — `USER_STATISTICS` / `user_statistics`
+и `GLOBAL_STATISTICS` / `global_statistics`.
+
+### Как устроена блокировка
+
+Ключ партиционирования — `user_id` отправителя: в модели сообщения это `sender_id`,
+в команде блокировки — `blocked_sender_id`. Например, при «Alice блокирует Bob»
+команда имеет ключ `Bob` и `recipient_id=Alice`; сообщения Bob тоже имеют ключ `Bob`.
+
+Обратный индекс `blockedBy[sender_id]` хранит множество пользователей, которые
+заблокировали этого отправителя. Команда выше добавляет Alice в `blockedBy["Bob"]`,
+а разблокировка удаляет её. При сообщении Bob достаточно прочитать одну запись
+индекса и вычислить `получатели = все участники − Bob − blockedBy["Bob"]`.
+Так не нужно обходить отдельный список блокировок каждого получателя.
+
+У `messages` и `blocked_users` одинаковое число партиций (3), сериализация ключа
+и алгоритм партиционирования. Поэтому записи с ключом `Bob` попадают в партиции
+с одинаковым номером. Оба процессора подключены к одному хранилищу `chat-blocked-by`
+в общей подтопологии: Kafka Streams назначает эти партиции одной задаче вместе
+с её локальным состоянием. Сообщения и блокировки отправителя обрабатываются
+в одном месте, без дополнительного перераспределения записей или удалённого чтения индекса.
+
+Общий ключ обеспечивает размещение данных, но не порядок между двумя топиками:
+блокировка влияет на сообщения, обработанные после применения команды.
+
+## Воспроизводимый сценарий
+
+После подготовки выше отправьте три сообщения, затем найдите их ID в логах:
 
 ```bash
-docker-compose run --rm --no-deps commands add alice bob stepan
+docker-compose run --rm --no-deps commands send Bob m1 'This is BAD!'
+docker-compose run --rm --no-deps commands send Bob m2 'bad badge'
+docker-compose run --rm --no-deps commands send Степан m3 'Привет!'
+docker-compose logs --tail=30 consumer
 ```
 
-`ChatCommandsKt` runs one command per invocation: read arguments, validate the
-command, send its records, wait for Kafka acknowledgements, close the producer,
-and exit. Your shell handles quoting and escaping. There is no input loop or
-custom command-line parser. Invalid commands and send failures exit nonzero.
-Multiple sends are not a transaction; a broker failure can leave some updates
-acknowledged. Publishing an update does not wait for Streams to apply it.
+| ID | Отправитель | Текст на выходе | Получатели |
+| --- | --- | --- | --- |
+| `m1` | Bob | `This is ***!` | Степан |
+| `m2` | Bob | `*** badge` | Степан |
+| `m3` | Степан | `Привет!` | Alice, Bob |
 
-The `commands` service has the `tools` profile, so normal `docker-compose up`
-does not start it. Explicit `docker-compose run commands ...` makes it available
-without enabling the profile separately. `--rm` removes the temporary container
-after it exits; `--no-deps` reuses the running stack without rerunning topic setup.
-See Docker's [on-demand services with profiles](https://docs.docker.com/compose/how-tos/profiles/).
-The entrypoint fixes the Java launcher and `ChatCommandsKt`, leaving the command
-arguments replaceable. No `stdin_open` or `tty` settings are needed.
+Alice не получает сообщения Bob, а сообщения Степана доходят обоим участникам.
+`BAD` маскируется, `badge` сохраняется. Дождитесь всех трёх записей в логах consumer.
 
-Run with `help` or no arguments to print available commands without creating a
-Kafka producer:
+### Сохранение блокировки после перезапуска
 
 ```bash
-docker-compose run --rm --no-deps commands help
+docker-compose restart chat
+docker-compose logs --since=1m --tail=30 chat
 ```
 
-Observe messages in another terminal:
+Дождитесь **нового** перехода в `RUNNING` после перезапуска, затем отправьте:
 
 ```bash
-docker-compose logs -f --tail=10 producer consumer
+docker-compose run --rm --no-deps commands send Bob m4 'BAD after restart'
+docker-compose logs --tail=30 consumer
 ```
 
-The `producer` and `consumer` services keep running until stopped. Each uses its
-own Kafka client; neither runs inside the Streams process.
-The producer can start sending while Streams is joining its consumer group;
-Kafka retains those messages until Streams processes them. After a restart,
-group rebalancing may delay the first output.
-The logs have this form (text abbreviated here):
+У `m4` ожидаются текст `*** after restart` и только Степан в получателях.
+Пользователей, стоп-слова и блокировку повторно не публикуем: проверяем сохранение
+состояния при обычном перезапуске с теми же Docker volumes.
 
-```text
-Produced topic=messages partition=<n> offset=<input-offset> key=alice messageId=<id> text="..."
-Consumed topic=filtered_messages partition=<n> offset=<output-offset> key=alice messageId=<id> recipients=[bob, stepan] text="..."
-```
-
-Compare the same `messageId` in both logs to see its journey through the app.
-The consumer prints every record; it does not filter for a particular ID or
-perform assertions. With the three demo users registered and no blocks, each
-message has the other two users as recipients. Configured stop words appear as
-`***` in the output text. On a fresh broker, messages initially have no recipients
-until registration is applied. Topic setup seeds neither users nor stop words.
-
-### Start ksqlDB and run SQL in Kafka UI
-
-The `ksqldb` service runs `confluentinc/cp-ksqldb-server:8.1.6` in interactive
-mode against `kafka:29092`. Kafka UI connects through
-`KAFKA_CLUSTERS_0_KSQLDBSERVER=http://ksqldb:8088` and waits for the server's
-health check. With the chat already running, start or update these services:
+Теперь снимите блокировку:
 
 ```bash
-docker-compose up -d ksqldb kafka-ui
-docker-compose ps ksqldb kafka-ui
+docker-compose run --rm --no-deps commands unblock Alice Bob
+docker-compose logs --tail=30 chat
 ```
 
-Open [Kafka UI](http://localhost:18080), select **module2**, open **KSQL DB**,
-and click **Execute KSQL Request**. Use its SQL editor to execute statements,
-starting with:
-
-```sql
-SHOW TOPICS;
-```
-
-This lists Kafka topics. `SHOW STREAMS;` and `SHOW TABLES;` list SQL objects,
-which are registered separately from the Kafka topics. The ksqlDB endpoint at
-[localhost:18088/info](http://localhost:18088/info) is a REST API; the browser
-SQL editor is provided by Kafka UI on port 18080.
-
-The setup file registers `MESSAGES_STREAM` over raw `messages`. It maps Protobuf
-fields 1–3 to `MESSAGE_ID`, `PAYLOAD_SENDER_ID`, and `TEXT`; the separate Kafka key
-is `SENDER_ID`. `PAYLOAD_SENDER_ID` is only a SQL alias for the payload's
-`sender_id`, avoiding a duplicate column name. `ROWTIME` exposes the Kafka record
-timestamp. Neither this declaration nor the naming cleanup changes `chat.proto`.
-
-The analytics use a different source stream over the filtered delivery topic:
-
-```sql
-CREATE STREAM IF NOT EXISTS FILTERED_MESSAGES_STREAM (
-  sender_id STRING KEY,
-  message STRUCT<message_id STRING, sender_id STRING, text STRING>,
-  recipient_ids ARRAY<STRING>
-) WITH (
-  KAFKA_TOPIC='filtered_messages',
-  KEY_FORMAT='KAFKA',
-  VALUE_FORMAT='PROTOBUF_NOSR'
-);
-```
-
-The Kotlin application writes plain Protobuf bytes. `PROTOBUF_NOSR` uses an
-explicit SQL schema without Schema Registry. Keep the value fields and nested
-fields in the order of their Protobuf field numbers in `chat.proto`.
-`CREATE STREAM` registers how to read the existing topic; it does not start a
-statistics aggregation or rewrite its messages. To inspect three new deliveries
-while the producer is running:
-
-```sql
-SELECT sender_id, message->text AS text, recipient_ids
-FROM FILTERED_MESSAGES_STREAM
-EMIT CHANGES LIMIT 3;
-```
-
-This is a streaming query: it waits for matching records, then finishes at the
-limit. Persistent statistics use `CREATE TABLE ... AS SELECT` below.
-Count messages before expanding recipient arrays, so empty lists still
-count and multiple recipients do not multiply message counts. If delivery
-batching is added, introduce a separate event once per processed message for
-message counts. Replaying deliveries covers only records still retained in
-Kafka; it cannot reconstruct expired history.
-
-The stable service ID `module2_` identifies ksqlDB's command and internal topics.
-SQL definitions and persistent queries are stored in Kafka, and local query
-state can be rebuilt from Kafka after container recreation. Keep the broker's
-`kafka-data` volume to retain this history. Interactive mode deliberately has
-no `KSQL_KSQL_QUERIES_FILE`, which would select headless mode and disable
-interactive SQL. See Confluent's
-[Docker configuration](https://docs.confluent.io/platform/8.1/ksqldb/operate-and-deploy/installation/install-ksqldb-with-docker.html)
-and [serialization formats](https://docs.confluent.io/platform/current/ksqldb/reference/serialization.html#protobuf).
-
-Historical ksqlDB setup checkpoint before the naming cleanup (2026-11-03):
-Compose configuration validated, ksqlDB 8.1.6 reported `RUNNING`, and Kafka UI
-executed `SHOW TOPICS;`. The source declaration using the previous names
-succeeded, and the preview query returned three live deliveries with decoded
-sender IDs, message text, and recipient arrays.
-
-### Statistics with SQL
-
-[ksqldb/ksqldb-queries.sql](ksqldb/ksqldb-queries.sql) implements steps 7–8
-entirely in ksqlDB. It registers two source streams and creates nine persistent
-queries over the existing Protobuf delivery envelopes:
-
-| SQL object | Purpose | Kafka topic |
-| --- | --- | --- |
-| `MESSAGES_STREAM` | Register raw input; not used by the delivery-based counters. | `messages` |
-| `FILTERED_MESSAGES_STREAM` | Register censored messages with final recipient lists. | `filtered_messages` |
-| `USER_MESSAGE_COUNTS` | Count delivery envelopes by sender, including empty recipient lists. | `user_message_counts` |
-| `RECIPIENT_EVENTS` | Expand each recipient array with `EXPLODE`. | `recipient_events` |
-| `SENDER_RECIPIENTS` | Keep one table row per `(sender_id, recipient_id)` pair. | `sender_recipients` |
-| `USER_RECIPIENT_COUNTS` | Count those table rows by sender. | `user_recipient_counts` |
-| `USER_STATISTICS` | Left join message and recipient counts, using zero when no recipient exists. | `user_statistics` |
-| `GLOBAL_MESSAGE_COUNTS` | Sum the current per-sender message totals into one global total. | `global_message_counts` |
-| `GLOBAL_RECIPIENTS` | Keep one table row per recipient across all sender-recipient pairs. | `global_recipients` |
-| `GLOBAL_RECIPIENT_COUNTS` | Count those recipient table rows once globally. | `global_recipient_counts` |
-| `GLOBAL_STATISTICS` | Left join global counts, using zero before any recipient is reached. | `global_statistics` |
-
-Run the setup from `assignments/module2` (with your active Compose project
-selected, as described above):
+Дождитесь `Applied UNBLOCK recipient=Alice sender=Bob`, затем отправьте:
 
 ```bash
-docker-compose exec -T ksqldb ksql http://localhost:8088 \
-  < ksqldb/ksqldb-queries.sql
+docker-compose run --rm --no-deps commands send Bob m5 'bad badge'
+docker-compose logs --tail=30 consumer
 ```
 
-Alternatively, paste the `CREATE` statements into Kafka UI in file order. For
-each request, set **Stream properties** to key `auto.offset.reset`, value
-`earliest`. The file's `SET` statement configures a CLI session; do not rely on it
-carrying over between separate UI requests. `earliest` includes retained history
-when a query first starts. Changing it later does not rewind an existing query's
-committed offsets. SQL definitions persist across container restarts.
-Every declaration uses `IF NOT EXISTS`: rerunning the file adds missing objects,
-including the global tables on a per-user-only installation, and preserves
-existing definitions and history. It does not upgrade an existing query whose
-definition has changed. The CLI reports an `already exists` message for objects
-it leaves in place. Inspect `SHOW TABLES;` and `SHOW QUERIES;` to verify the
-eight tables and nine persistent queries after setup. This assumes the renamed
-topics; it does not migrate the old `module2.chat.*` setup.
+У `m5` текст `*** badge`, получатели — Alice и Степан.
+Команды и сообщения находятся в разных топиках: ожидание `Applied` исключает
+гонку между изменением блокировки и отправкой. Порядок получателей в списке не важен.
 
-Read a current snapshot in Kafka UI:
+### Ожидаемая статистика
 
-```sql
-SELECT * FROM USER_STATISTICS;
-```
-
-Read one sender or watch subsequent updates:
-
-```sql
-SELECT * FROM USER_STATISTICS WHERE SENDER_ID = 'bob';
-
-SELECT * FROM USER_STATISTICS EMIT CHANGES LIMIT 10;
-```
-
-The columns are `SENDER_ID`, `MESSAGE_COUNT`, and `UNIQUE_RECIPIENT_COUNT`.
-A sender with no processed messages has no row yet (conceptually zero counts).
-A sender with messages but no eligible recipients has a row with recipient
-count zero. Fully censored messages still count normally.
-
-To inspect incoming messages separately after running the setup file:
-
-```sql
-SELECT SENDER_ID, MESSAGE_ID, TEXT, ROWTIME AS TIMESTAMP
-FROM MESSAGES_STREAM
-EMIT CHANGES LIMIT 3;
-```
-
-This reads raw input and does not apply censorship or blocking. Recipient
-selection is visible through `FILTERED_MESSAGES_STREAM`.
-
-The distinct count is exact: another message to an existing recipient updates
-the pair's `SELECTION_COUNT` but does not add a table row. The next aggregation
-counts **table rows**, so that update does not increase the distinct count.
-Blocking or removing a recipient later does not delete a historical pair.
-`COUNT_DISTINCT` is approximate, and `COLLECT_SET` has a size limit; neither is
-used for this exact, uncapped count. See Confluent's
-[aggregate function reference](https://docs.confluent.io/platform/current/ksqldb/developer-guide/ksqldb-reference/aggregate-functions.html).
-
-The per-user SQL output topics have three partitions and JSON values. Keys use `KAFKA`
-(a plain sender string), except `SENDER_RECIPIENTS`, whose composite key
-uses JSON. Table topics use compaction; the recipient event stream uses deletion.
-For example, the final topic can contain key `bob` with value
-`{"MESSAGE_COUNT":3,"UNIQUE_RECIPIENT_COUNT":2}`. These are replacement snapshots,
-so consumers must not sum successive values. The Kotlin delivery consumer
-continues reading only Protobuf deliveries; inspect JSON statistics through
-SQL or Kafka UI.
-
-ksqlDB owns separate Kafka Streams tasks and state stores. Message counting is
-grouped by the existing sender key; pair aggregation repartitions by the two
-fields, and recipient counting regroups the table by sender. The final join
-uses the sender key. Expanding arrays adds one event per selected recipient,
-and stored pair state grows with the number of distinct relationships. The
-two branches update independently, so the combined table can briefly show a
-new message count before its recipient count catches up.
-
-Counting assumes the current contract of one envelope per processed message.
-Application-level duplicate envelopes count again; deduplication by message ID
-and transactional recovery guarantees are not implemented here (see step 9).
-Future delivery batching must preserve a separate once-per-message input for
-the message-count query.
-
-Historical checkpoint before the naming cleanup, verified on 2026-11-03 with
-ksqlDB 8.1.6: checks passed Bob's `2/1` then
-`3/2` checkpoint, independent Stepan counts, fully censored text, an initially
-empty recipient list, and preservation of historical reach after an empty
-delivery. All five live queries were created, and the combined table returned
-sender/message/recipient rows. The pre-existing local message-count query was
-preserved and counts from its original start; the new recipient branch replayed
-retained deliveries. A fresh setup using the file starts both from `earliest`.
-
-### Global statistics and verification
-
-Read the current global snapshot or either individual counter:
-
-```sql
-SELECT * FROM GLOBAL_STATISTICS WHERE STATISTICS_KEY = 'all';
-SELECT MESSAGE_COUNT FROM GLOBAL_MESSAGE_COUNTS WHERE STATISTICS_KEY = 'all';
-SELECT UNIQUE_RECIPIENT_COUNT FROM GLOBAL_RECIPIENT_COUNTS WHERE STATISTICS_KEY = 'all';
-```
-
-Watch subsequent global updates:
-
-```sql
-SELECT * FROM GLOBAL_STATISTICS EMIT CHANGES LIMIT 10;
-```
-
-The combined row has `STATISTICS_KEY='all'`, `MESSAGE_COUNT`, and
-`UNIQUE_RECIPIENT_COUNT`. Before any message, there is no row (conceptually
-`0/0`). After messages with no recipients, the combined row reports a positive
-message count and zero recipients; the standalone recipient-count table has no
-row until the first recipient is selected. All counts describe historical
-delivery decisions, so later blocking or membership removal does not subtract
-previously reached recipients.
-
-`GLOBAL_MESSAGE_COUNTS` sums **table rows** from `USER_MESSAGE_COUNTS`. When Bob's
-total changes from 1 to 2, the global sum replaces his old contribution and
-increases by one. It does not sum successive count events. `GLOBAL_RECIPIENTS`
-regroups `SENDER_RECIPIENTS` by recipient; its `SENDER_COUNT` is the number of
-distinct senders who have reached that recipient. Counting those table rows
-produces exact global uniqueness. Alice remains one row even when both Bob and
-Stepan reach her. Summing per-user unique counts would incorrectly count her
-twice. These use the existing
-[ksqlDB table aggregation semantics](https://docs.confluent.io/platform/current/ksqldb/developer-guide/ksqldb-reference/create-table-as-select.html).
-
-Both global branches read compacted table topics from `earliest` on initial
-installation. This lets them reconstruct the existing tables' retained history,
-including counts and pairs whose original delivery events have expired. They
-inherit the history of those source tables; they cannot repair earlier missing
-data or duplicate processing. The branches update asynchronously, so the joined
-global row can briefly mix a new message count with an older recipient count.
-
-Regrouping pair rows by recipient requires repartitioning across three
-partitions. The two global counters repartition to the constant key `all` and
-use one partition each, as does their final join. All four global output topics
-are compacted, with string keys and JSON values. Global recipient state grows
-with distinct recipients. The global branch reuses existing pair rows and adds
-no new recipient-array expansion, though repeated selections still propagate
-table updates. A single global key limits throughput to one aggregation task;
-additional partitions cannot distribute that one counter.
-
-Verified step-8 checkpoint (2026-11-03, ksqlDB 8.1.6): development checks passed
-all three statistics scenarios. The complete Alice/Bob/Stepan example reaches **4 messages / 3 unique
-recipients**, with Bob at `3/2` and Stepan at `1/2`. Two additional empty
-deliveries bring the global result to `6/3`. A separate fresh-state scenario
-verifies `1/0`, `2/0`, then `3/1` when the first recipient becomes eligible.
-These checks used final Protobuf delivery decisions; the topology tests
-separately verify the censorship and blocking that produce those decisions.
-
-The complete setup was also applied to the running `kafka-module2-task-names`
-stack: all nine persistent queries reported `RUNNING` with no query errors,
-and a pull query returned the global row. Rerunning the setup preserved all nine
-query IDs. At this checkpoint the fresh `users` topic was empty, so live messages
-had zero eligible recipients. Registering the demo users with the command above
-enables recipient selection for subsequent messages; historical empty deliveries
-remain counted.
-
-### Change membership while the demo runs
-
-From `assignments/module2`, remove Stepan:
+Проверочные запросы сохранены в [test-queries.sql](ksqldb/test-queries.sql).
+Выполните их после нужного этапа сценария:
 
 ```bash
-docker-compose run --rm --no-deps commands remove stepan
+docker-compose run --rm --no-deps ksqldb-check
 ```
 
-Once the tombstone has been applied, Bob's messages target only Alice. The
-producer continues cycling through its three sender IDs; membership controls
-recipient selection. Restore Stepan with:
-
-```bash
-docker-compose run --rm --no-deps commands add stepan
-```
-
-You can also register a user who never sends a message, then remove them:
-
-```bash
-docker-compose run --rm --no-deps commands add dana
-docker-compose run --rm --no-deps commands remove dana
-```
-
-The command waits for Kafka to acknowledge the update. The global table consumes
-updates asynchronously, so that acknowledgement does not mean every Streams
-instance has applied it yet. Observe subsequent delivery logs to see the change.
-Membership changes do not emit deliveries or modify earlier envelopes. Tests
-apply user updates before the corresponding messages explicitly.
-
-`ChatTopicSetupKt` only creates/checks topics and accepts no runtime commands.
-The `add` and `remove` commands only update the specified users. Topic setup does
-not re-register anyone; membership persists in the compacted topic until
-explicitly changed by a command.
-
-### Blocking state and task locality
-
-`BlockCommandProcessor` maintains `chat-blocked-by`, a persistent key-value store
-with a Kafka changelog. Its key is the blocked sender ID; its value is an internal
-`BlockedRecipients` Protobuf containing the set of recipients who blocked that
-sender. For example, Alice's block of Bob adds `alice` to `blockedBy["bob"]`.
-Stepan's block of Bob adds another member without replacing Alice's choice.
-`UNBLOCK` removes only the issuing recipient, and the last removal deletes the
-store entry. Repeating either action leaves the set unchanged.
-
-Both processors explicitly connect to this same store in `ChatTopology`. That
-connection places message input and block-command input in one subtopology.
-With matching keys, serializers, partitioning, and three partitions on both
-topics, each task owns the corresponding input partition from each topic and
-its part of the blocking index. No repartition topic is needed. Merely giving
-two independent streams the same keys would not connect their tasks.
-See Kafka's [task and state-store architecture](https://kafka.apache.org/41/streams/architecture/).
-
-For Bob's message, recipient selection reads `blockedBy["bob"]` once, converts
-it to a set, and excludes those IDs while scanning the user registry. Alice's
-block of Bob does not stop Bob from receiving Alice's messages or stop Stepan
-from receiving Bob's messages. Blocking does not change membership; blocks can
-exist before registration and persist through removal and re-registration.
-
-Commands emit no deliveries. They must have a non-empty key equal to
-`blocked_sender_id`, a non-empty `recipient_id`, and action `BLOCK` or `UNBLOCK`.
-Null values, malformed Protobuf, unspecified actions, and unknown actions fail
-processing. A tombstone is not an unblock command. The command topic retains
-the full event history; the compacted internal changelog can instead retain
-the latest complete blocking set for each sender.
-
-### Apply a block and unblock
-
-With the demo running, execute from `assignments/module2`:
-
-```bash
-docker-compose run --rm --no-deps commands block alice bob
-```
-
-Arguments are **recipient first, blocked sender second**: Alice blocks Bob.
-The command publishes a `BlockCommand` with key `bob`. After Streams applies it,
-Bob's subsequent messages target `[stepan]`. Alice's messages still target
-`[bob, stepan]`, and Stepan's target `[alice, bob]`, assuming no other blocks.
-Observe deliveries in the consumer logs. Restore Alice's eligibility with:
-
-```bash
-docker-compose run --rm --no-deps commands unblock alice bob
-```
-
-After the unblock is applied, Bob's messages again target `[alice, stepan]`.
-Repeating these commands is safe. Default topic setup does not clear blocks;
-use explicit `unblock` commands to remove blocks left by earlier demo runs.
-The `block` and `unblock` commands only publish their requested update; they do
-not run topic setup or register users.
-
-A producer acknowledgement means Kafka accepted the command, not that Streams
-applied it. Messages use the state available **when processed**. Messages and
-commands for Bob share a partition number and task, but belong to different
-topic-partitions, each with its own offsets and ordering. Neither matching keys
-nor publishing a block first establishes a total order across those inputs.
-Check subsequent delivery logs for the effect; earlier envelopes stay unchanged.
-The topology tests explicitly pipe each update before the message it must affect.
-
-### Global censorship and word matching
-
-`ChatTopology` materializes `stop_words` as the global store
-`chat-stop-words`. Like `chat-users`, it is replicated on every Streams instance
-and accessible without listing it in a processor's `processValues` arguments.
-Its single partition does not need to match the sender topics' three partitions.
-
-`CensorshipProcessor` runs before `RecipientSelectionProcessor`. For each message,
-it collects the current stop words into a set. `censor(text, stopWords)` scans
-complete words, lowercases each with `Locale.ROOT` for comparison, and replaces
-every match with exactly `***`. Unmatched words retain their original case, and
-all separators remain unchanged, including punctuation, spaces, and newlines.
-For this exercise, words consist of Unicode letters, combining marks, numbers,
-and underscores. Thus `bad` matches `BAD!` and `(bad)`, but not `badge`, `bad2`,
-`bad_bad`, or a larger word containing an accent. Hyphens and apostrophes are
-separators. Russian words use the same normalization and matching rules.
-
-The processor preserves the Kafka key and message ID and forwards one message,
-even when its entire text becomes `***`. Recipient selection then applies
-membership and blocking as usual. No recipients still means one envelope with
-an empty recipient list. Later statistics can therefore count the message once.
-
-Stop-word records must already contain a normalized word matching their key.
-As with the user registry, table payloads are validated when a message reads
-the store. Empty words, phrases, punctuation, mismatched or unnormalized entries,
-and malformed Protobuf fail processing. A tombstone removes a rule. Rule updates
-produce no deliveries and do not change previously emitted messages.
-
-This implementation scans the stop-word table for each message, which is simple
-for the exercise's small rule set. That work grows with the number of rules.
-
-### Add and remove stop words
-
-After rebuilding and starting the demo, execute from `assignments/module2`:
-
-```bash
-docker-compose run --rm --no-deps commands add-stop-word ' BAD ' война
-```
-
-The command trims and lowercases each argument before publishing it as both key
-and `StopWord.word`. It validates all arguments before sending any updates.
-`BAD` becomes key/value `bad`; `война` also demonstrates censorship with the
-Russian sentence source. Once applied, `This is BAD!` becomes `This is ***!`,
-`bad badge` becomes `*** badge`, and `ВОЙНА` becomes `***`.
-The producer still reads sentences from its configured source; the exact example
-strings are exercised by the topology tests. Remove rules with:
-
-```bash
-docker-compose run --rm --no-deps commands remove-stop-word BAD война
-```
-
-Removal publishes tombstones under the normalized keys. Repeated adds or removals
-are safe; the commands do not change users or run default topic setup. Existing
-stop words survive restarts until explicitly removed. Kafka acknowledging an
-update does not confirm every instance has applied it; observe subsequent
-deliveries. Tests apply updates synchronously before the messages they affect.
-
-### Sentence source and sender rotation
-
-The default source is the Russian text of *War and Peace* from
-[this gist](https://gist.github.com/romaklimenko/c95f3a864828f7f034b7a33d1676e420).
-The producer downloads its raw UTF-8 text once on startup, then splits it on the
-literal `.` character:
-
-```kotlin
-text.split('.')
-    .map { it.trim() }
-    .filter { it.isNotEmpty() }
-```
-
-Each non-empty piece becomes a message, without the separating period. Only
-surrounding whitespace is removed; headings and internal line breaks remain.
-`!` and `?` do not split messages, and periods in abbreviations do. This simple
-rule is sufficient for the demo.
-
-The producer sends one sentence at a time with a fresh UUID, using sender IDs
-`alice`, `bob`, and `stepan` in that order, then repeats the sender rotation.
-The Kafka key equals the message's `sender_id`. After each acknowledged send,
-it waits one second by default. At the end of the sentence list it loops back
-to the beginning, continuing the sender rotation independently. Restarting the
-producer downloads the source again and starts from Alice and the first sentence.
-
-The source must be reachable from the producer container. HTTP failures or an
-empty sentence list stop the producer with an error. To use another UTF-8
-plain-text URL or change the interval, set these Compose environment variables:
-
-```bash
-SENTENCE_SOURCE_URL=https://gist.githubusercontent.com/romaklimenko/c95f3a864828f7f034b7a33d1676e420/raw/warandpeace.txt \
-PRODUCER_INTERVAL_MS=2000 docker-compose up -d producer
-```
-
-Pause and resume message generation independently of processing and logging:
-
-```bash
-docker-compose stop producer
-docker-compose start producer
-```
-
-### Consumer offsets
-
-The logger subscribes to `filtered_messages` with its own consumer group,
-`module2-chat-logger`. It uses `auto.offset.reset=earliest`: on its first run,
-with no committed offsets, it reads all retained output records. That also
-covers records produced before the consumer finishes starting.
-
-It auto-commits offsets every second while polling. On later runs, it resumes
-from committed offsets. There are no `seek` calls or manual partition
-assignments. A crash can cause some records to be logged again; this logger
-does not promise exactly-once console output. Its offsets are independent of
-the Streams application's input offsets.
-
-### What to inspect
-
-```bash
-docker-compose exec -T kafka /opt/kafka/bin/kafka-topics.sh \
-  --bootstrap-server kafka:29092 --describe --topic messages
-docker-compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
-  --bootstrap-server kafka:29092 --describe --group module2-chat
-```
-
-- **Application ID:** `module2-chat` identifies this Streams application and its
-  consumer group. Instances with the same ID share the work and committed input
-  offsets. Changing the ID starts an independent application.
-- **Tasks:** messages and block commands each have three partitions. Their
-  shared store connects them into three tasks, each owning the same partition
-  number from both topics. One configured stream thread handles those tasks;
-  three tasks do not mean three application processes or three threads. A
-  separate global thread maintains the complete user registry for the instance.
-- **Partition and order:** each sender's key selects an input partition. The
-  unchanged key and matching output partition count select the same partition
-  number for the delivery envelope. Different senders can share a partition.
-  Round-robin order describes the producer's sends; the consumer can interleave
-  partitions differently. Kafka preserves order within each partition.
-- **Offsets:** each topic-partition has its own sequence. Input and output
-  offsets need not match even when their partition numbers do. The consumer-group
-  report shows the application's committed input positions, not output offsets.
-- **Restart position:** `earliest` applies only when no valid committed offset
-  exists. Otherwise the application resumes from its committed position. The
-  one-second commit interval makes progress visible during the exercise.
-- **Processing guarantee:** this step uses the default at-least-once behavior.
-  A failure can cause an input to be processed again. Transactional processing
-  and recovery verification are part of step 9.
-
-The demo now illustrates transport, censorship, recipient selection, and blocking.
-The SQL queries above let the reviewer inspect per-sender and global counters.
-The producer supplies message text; all business processing runs in the Streams
-application.
-
-### Test recipient selection, blocking, and censorship
-
-From the repository root, with JDK 21 and Maven available:
-
-```bash
-mvn -Dkotlin.compiler.daemon=false test
-```
-
-The JUnit tests use Kafka's `TopologyTestDriver` with the real topology and
-Protobuf records. They cover exclusion of the sender, exactly one envelope per
-message, joining users, repeated registrations, tombstones and re-registration,
-empty recipient lists, preserved message fields, and invalid IDs or keys.
-Blocking tests cover the step-5 checkpoint, its direction, multiple blockers,
-repeated commands, independent senders, membership changes, and invalid commands.
-Censorship tests cover adding/removing rules, repeated updates, mixed case,
-punctuation and whitespace, repeated matches, longer words, Unicode words,
-fully masked messages, empty recipient lists, and invalid rule payloads. The
-normalization tests also run with Turkish as the default locale to verify
-explicit `Locale.ROOT` handling.
-Command tests use Kafka's `MockProducer` to verify keys, Protobuf values,
-tombstones, normalization, and validation before sending.
-A topology-description assertion checks that both inputs and both processors
-share the blocking store in one subtopology without a repartition source.
-The driver applies global-table input synchronously; the live demo has the
-asynchronous update timing described above.
-
-Verified step-4 checkpoint (2026-11-03): all seven topology tests passed locally and
-in the Docker image's Maven `verify` build. The live demo restored the three
-seeded users and selected the other two users for each sender. After publishing
-Stepan's tombstone, Bob's recipient list changed from `[alice, stepan]` to
-`[alice]`. Re-registering Stepan restores the original membership.
-
-Verified step-5 checkpoint (2026-11-03): all 21 topology test cases passed in the
-Docker image's Maven `verify` build. After Alice's block was applied, Bob targeted
-only Stepan, while Alice still targeted Bob and Stepan and Stepan still targeted
-Alice and Bob. Unblocking restored Alice's eligibility for Bob's messages.
-The topology check confirmed both sender-keyed inputs share the blocking store.
-This checkpoint used `TopologyTestDriver`; it does not verify live cross-topic
-timing or recovery, which remains part of step 9.
-
-Verified step-6 checkpoint (2026-11-03): the Docker image's Maven `verify` build
-passed all 50 tests (43 topology cases and 7 normalization cases). With `bad`
-configured, `This is BAD!` became `This is ***!`, `bad, really bad!` became
-`***, really ***!`, and `badge` stayed unchanged. Removing rules restored their
-original text in subsequent messages. A message containing only `bad` became
-`***` and still emitted exactly one envelope, including with no eligible
-recipients. This checkpoint used `TopologyTestDriver`, not a live broker run.
-
-Stop the module-2 services with:
-
-```bash
-docker-compose down
-```
-
-Broker data and the application's state directory remain in named volumes.
-
-## Implementation plan
-
-Work through one step at a time. Before each change, explain the decision and
-the Kafka Streams concept involved. Afterward, inspect the code, run a focused
-example or test, and compare the result with the checkpoint. Discuss the result
-before moving to the next step, and update this README as implementation
-progresses.
-
-- [x] **1. Define the behavior with concrete examples.**
-
-    Specify recipients, directional blocking, censorship, rule updates, and the
-    meaning of each statistic. Establish that messages with no eligible
-    recipients still count and that recipient counts describe delivery
-    decisions, not client acknowledgements.
-
-    **Checkpoint:** the Alice/Bob/Stepan scenario above provides expected message
-    text, recipients, and statistics to use throughout implementation.
-
-- [x] **2. Define events, topics, and keys.**
-
-    Introduce message, user, block/unblock, stop-word, and delivery-envelope
-    models using the existing Protobuf tooling. Key messages by `senderId`,
-    blocking commands by the blocked sender's ID, and user and stop-word updates
-    by their respective identities. Define matching partitioning where records
-    and state must be colocated.
-
-    **Checkpoint:** trace "Alice blocks Bob" and "Bob sends hello" through their
-    topic keys and explain where the related state will live.
-
-- [x] **3. Run the smallest Kafka Streams application.**
-
-    Add module-2 startup configuration, topic creation, and a topology that reads
-    a message and wraps it in a delivery envelope with an empty recipient list.
-    Preserve the message fields and sender key. Reuse the existing Maven/JVM
-    setup. Keep topology construction separate from application startup so
-    processing can be tested without a broker. Run the sentence producer and
-    output logger as separate Compose services.
-
-    **Checkpoint:** send one known message and inspect its key, value,
-    partition, and output. Explain `application.id`, tasks, and offsets using
-    this run.
-
-- [x] **4. Add users and recipient selection.**
-
-    Maintain the shared user registry in replicated local state. Calculate
-    recipients for each message, exclude the sender, and populate the delivery
-    envelope's recipient IDs.
-
-    **Checkpoint:** with Alice, Bob, and Stepan registered, Bob's message targets
-    Alice and Stepan. Explain how the envelope avoids a separate message record
-    for every recipient.
-
-- [x] **5. Implement blocking.**
-
-    Build the inverse index `blocked sender -> users who blocked that sender`
-    and apply it during recipient selection. Add focused topology tests for
-    block, unblock, repeated commands, and the direction of blocking. Explain
-    when an update takes effect and why matching keys across separate topics
-    do not establish a single ordering.
-
-    **Checkpoint:** after Alice's block of Bob is applied, Bob's next message
-    targets Stepan. Stepan's messages still target Alice and Bob. Unblocking
-    restores Alice's eligibility for Bob's subsequent messages.
-
-- [x] **6. Add global censorship.**
-
-    Maintain the shared stop-word state. Before recipient selection or
-    statistics, replace case-insensitive, whole-word matches with exactly `***`
-    while preserving surrounding text and punctuation. Censored messages remain
-    eligible for delivery and count normally.
-
-    **Checkpoint:** demonstrate adding and removing a stop word, mixed case,
-    punctuation, repeated matches, a word inside a longer word, and a message
-    whose entire text becomes `***`.
-
-- [x] **7. Add per-sender statistics with ksqlDB.**
-
-    Aggregate delivery decisions into each sender's message count and an exact
-    table of historical sender-recipient pairs. Publish statistics as keyed
-    updates. Count the original message once regardless of recipient fan-out
-    or future delivery batches. Explain how ksqlDB maintains its own state and
-    tasks using the sender-keyed output of the Kotlin application.
-
-    **Checkpoint:** Bob sends twice to Stepan: two messages and one unique
-    recipient. After Alice unblocks Bob, another message brings Bob's totals to
-    three messages and two unique recipients.
-
-- [x] **8. Add global statistics with ksqlDB.**
-
-    Sum current per-sender message totals globally. Deduplicate historical
-    recipient relationships by recipient in a separate table and count its rows
-    for exact global uniqueness. Reuse the sender-recipient table without a new
-    array expansion. Document repartitioning and the single global key's
-    throughput limit. Use a left join to show zero before any recipient is reached.
-
-    **Checkpoint:** Bob and Stepan both target Alice, but Alice contributes only
-    once to the global unique-recipient count. Verify the complete scenario's
-    totals without summing per-sender unique counts.
-
-- [ ] **9. Verify recovery and processing guarantees.**
-
-    Restart the application and verify recovery of blocking state, recipient
-    history, and counts. Configure transactional processing for Kafka outputs
-    and state updates. Explain the guarantee's boundary: application-level
-    duplicate submissions require a separate policy.
-
-    **Checkpoint:** process a known sequence, restart, continue processing, and
-    compare the recovered state and final totals with the expected results.
-
-- [ ] **10. Run the complete scenario across two instances.**
-
-    Run multiple Streams instances, inspect task assignment, and demonstrate
-    how sender-owned state moves during a rebalance. Add reproducible demo
-    commands and verification instructions to this README. Record remaining
-    scaling limits, including hot senders and large recipient sets.
-
-    **Checkpoint:** with rule updates applied before the corresponding messages,
-    the example scenario produces the expected recipients and eventual
-    statistics with either one instance or two.
+Файл выводит `SHOW QUERIES`, таблицу `USER_STATISTICS` и глобальную строку
+`GLOBAL_STATISTICS`. Эти же запросы можно выполнить в Kafka UI.
+
+Должно быть 9 работающих постоянных запросов. Дождитесь обновления таблиц:
+
+| После шага | Bob: сообщения / уникальные получатели | Степан: сообщения / уникальные получатели | Глобально: сообщения / уникальные получатели |
+| --- | --- | --- | --- |
+| `m1`–`m3` | 2 / 1 | 1 / 2 | 3 / 3 |
+| `m4` | 3 / 1 | 1 / 2 | 4 / 3 |
+| `m5` | 4 / 2 | 1 / 2 | 5 / 3 |
+
+У Alice нет строки: она не отправляла сообщения. Повторная отправка команд `send`
+увеличит счётчики даже с тем же `message_id`: дедупликация по ID не реализована.
+Для повторения точных значений начните с пустого состояния. Блокировка или удаление
+участника не уменьшает историческое число уникальных получателей.
+
+Остановка: `docker-compose down`. Данные остаются в томах; `down -v` их удалит.

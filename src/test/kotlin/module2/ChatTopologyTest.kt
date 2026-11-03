@@ -62,7 +62,7 @@ class ChatTopologyTest {
 
     @Test
     fun `each sender reaches the other registered users in one envelope`() {
-        val members = listOf("alice", "bob", "stepan")
+        val members = listOf("Alice", "Bob", "Степан")
         members.forEach(::register)
         assertTrue(deliveries.isEmpty)
 
@@ -71,135 +71,135 @@ class ChatTopologyTest {
 
     @Test
     fun `joining users can receive without sending and repeated registration does not duplicate them`() {
-        register("alice")
-        assertRecipients("bob", listOf("alice"))
+        register("Alice")
+        assertRecipients("Bob", listOf("Alice"))
 
-        register("stepan")
-        register("stepan")
+        register("Степан")
+        register("Степан")
         assertTrue(deliveries.isEmpty)
-        assertRecipients("bob", listOf("alice", "stepan"))
+        assertRecipients("Bob", listOf("Alice", "Степан"))
     }
 
     @Test
     fun `tombstones remove membership and registration can restore it`() {
-        listOf("alice", "bob", "stepan").forEach(::register)
-        users.pipeInput("alice", null)
-        users.pipeInput("alice", null)
+        listOf("Alice", "Bob", "Степан").forEach(::register)
+        users.pipeInput("Alice", null)
+        users.pipeInput("Alice", null)
         users.pipeInput("absent-user", null)
         assertTrue(deliveries.isEmpty)
-        assertRecipients("bob", listOf("stepan"))
+        assertRecipients("Bob", listOf("Степан"))
 
-        register("alice")
-        assertRecipients("bob", listOf("alice", "stepan"))
+        register("Alice")
+        assertRecipients("Bob", listOf("Alice", "Степан"))
     }
 
     @Test
     fun `empty registry and sender-only registry still emit one envelope`() {
-        assertRecipients("bob", emptyList())
-        register("bob")
-        assertRecipients("bob", emptyList())
+        assertRecipients("Bob", emptyList())
+        register("Bob")
+        assertRecipients("Bob", emptyList())
     }
 
     @Test
     fun `blocking is directional and unblocking affects subsequent messages`() {
-        listOf("alice", "bob", "stepan").forEach(::register)
-        assertRecipients("bob", listOf("alice", "stepan"))
+        listOf("Alice", "Bob", "Степан").forEach(::register)
+        assertRecipients("Bob", listOf("Alice", "Степан"))
 
-        updateBlock("alice", "bob", BlockCommand.Action.BLOCK)
-        assertRecipients("bob", listOf("stepan"))
-        assertRecipients("alice", listOf("bob", "stepan"))
-        assertRecipients("stepan", listOf("alice", "bob"))
+        updateBlock("Alice", "Bob", BlockCommand.Action.BLOCK)
+        assertRecipients("Bob", listOf("Степан"))
+        assertRecipients("Alice", listOf("Bob", "Степан"))
+        assertRecipients("Степан", listOf("Alice", "Bob"))
 
-        updateBlock("alice", "bob", BlockCommand.Action.UNBLOCK)
-        assertRecipients("bob", listOf("alice", "stepan"))
+        updateBlock("Alice", "Bob", BlockCommand.Action.UNBLOCK)
+        assertRecipients("Bob", listOf("Alice", "Степан"))
     }
 
     @Test
     fun `repeated commands have set semantics and unblocking preserves other blockers`() {
-        listOf("alice", "bob", "stepan").forEach(::register)
-        updateBlock("alice", "bob", BlockCommand.Action.UNBLOCK)
-        assertRecipients("bob", listOf("alice", "stepan"))
+        listOf("Alice", "Bob", "Степан").forEach(::register)
+        updateBlock("Alice", "Bob", BlockCommand.Action.UNBLOCK)
+        assertRecipients("Bob", listOf("Alice", "Степан"))
 
-        updateBlock("alice", "bob", BlockCommand.Action.BLOCK)
-        updateBlock("alice", "bob", BlockCommand.Action.BLOCK)
-        assertRecipients("bob", listOf("stepan"))
-        updateBlock("stepan", "bob", BlockCommand.Action.BLOCK)
-        updateBlock("stepan", "bob", BlockCommand.Action.BLOCK)
-        assertRecipients("bob", emptyList())
+        updateBlock("Alice", "Bob", BlockCommand.Action.BLOCK)
+        updateBlock("Alice", "Bob", BlockCommand.Action.BLOCK)
+        assertRecipients("Bob", listOf("Степан"))
+        updateBlock("Степан", "Bob", BlockCommand.Action.BLOCK)
+        updateBlock("Степан", "Bob", BlockCommand.Action.BLOCK)
+        assertRecipients("Bob", emptyList())
 
-        updateBlock("alice", "bob", BlockCommand.Action.UNBLOCK)
-        updateBlock("alice", "bob", BlockCommand.Action.UNBLOCK)
-        updateBlock("absent-user", "bob", BlockCommand.Action.UNBLOCK)
-        assertRecipients("bob", listOf("alice"))
+        updateBlock("Alice", "Bob", BlockCommand.Action.UNBLOCK)
+        updateBlock("Alice", "Bob", BlockCommand.Action.UNBLOCK)
+        updateBlock("absent-user", "Bob", BlockCommand.Action.UNBLOCK)
+        assertRecipients("Bob", listOf("Alice"))
 
-        updateBlock("stepan", "bob", BlockCommand.Action.UNBLOCK)
-        updateBlock("stepan", "bob", BlockCommand.Action.UNBLOCK)
-        assertRecipients("bob", listOf("alice", "stepan"))
-        updateBlock("alice", "bob", BlockCommand.Action.BLOCK)
-        assertRecipients("bob", listOf("stepan"))
+        updateBlock("Степан", "Bob", BlockCommand.Action.UNBLOCK)
+        updateBlock("Степан", "Bob", BlockCommand.Action.UNBLOCK)
+        assertRecipients("Bob", listOf("Alice", "Степан"))
+        updateBlock("Alice", "Bob", BlockCommand.Action.BLOCK)
+        assertRecipients("Bob", listOf("Степан"))
     }
 
     @Test
     fun `each sender has an independent inverse blocking index`() {
-        listOf("alice", "bob", "stepan").forEach(::register)
-        updateBlock("alice", "bob", BlockCommand.Action.BLOCK)
-        updateBlock("alice", "stepan", BlockCommand.Action.BLOCK)
-        updateBlock("bob", "stepan", BlockCommand.Action.BLOCK)
-        assertRecipients("bob", listOf("stepan"))
-        assertRecipients("stepan", emptyList())
-        assertRecipients("alice", listOf("bob", "stepan"))
+        listOf("Alice", "Bob", "Степан").forEach(::register)
+        updateBlock("Alice", "Bob", BlockCommand.Action.BLOCK)
+        updateBlock("Alice", "Степан", BlockCommand.Action.BLOCK)
+        updateBlock("Bob", "Степан", BlockCommand.Action.BLOCK)
+        assertRecipients("Bob", listOf("Степан"))
+        assertRecipients("Степан", emptyList())
+        assertRecipients("Alice", listOf("Bob", "Степан"))
 
-        updateBlock("alice", "bob", BlockCommand.Action.UNBLOCK)
-        assertRecipients("bob", listOf("alice", "stepan"))
-        assertRecipients("stepan", emptyList())
+        updateBlock("Alice", "Bob", BlockCommand.Action.UNBLOCK)
+        assertRecipients("Bob", listOf("Alice", "Степан"))
+        assertRecipients("Степан", emptyList())
     }
 
     @Test
     fun `blocking is independent of membership changes`() {
-        updateBlock("alice", "bob", BlockCommand.Action.BLOCK)
-        listOf("alice", "bob", "stepan").forEach(::register)
-        assertRecipients("bob", listOf("stepan"))
-        users.pipeInput("alice", null)
-        register("alice")
-        assertRecipients("bob", listOf("stepan"))
+        updateBlock("Alice", "Bob", BlockCommand.Action.BLOCK)
+        listOf("Alice", "Bob", "Степан").forEach(::register)
+        assertRecipients("Bob", listOf("Степан"))
+        users.pipeInput("Alice", null)
+        register("Alice")
+        assertRecipients("Bob", listOf("Степан"))
 
-        updateBlock("alice", "bob", BlockCommand.Action.UNBLOCK)
-        assertRecipients("bob", listOf("alice", "stepan"))
+        updateBlock("Alice", "Bob", BlockCommand.Action.UNBLOCK)
+        assertRecipients("Bob", listOf("Alice", "Степан"))
     }
 
     @ParameterizedTest
     @MethodSource("censorshipExamples")
     fun `censorship replaces whole words and preserves surrounding text`(text: String, expectedText: String) {
-        listOf("alice", "bob", "stepan").forEach(::register)
+        listOf("Alice", "Bob", "Степан").forEach(::register)
         listOf("bad", "привет", "café").forEach(::addStopWord)
-        assertRecipients("bob", listOf("alice", "stepan"), text, expectedText)
+        assertRecipients("Bob", listOf("Alice", "Степан"), text, expectedText)
     }
 
     @Test
     fun `adding and removing stop words changes only subsequent messages`() {
-        register("alice")
-        assertRecipients("bob", listOf("alice"), "bad evil", "bad evil")
+        register("Alice")
+        assertRecipients("Bob", listOf("Alice"), "bad evil", "bad evil")
         addStopWord(" BAD ")
         addStopWord("bad")
-        assertRecipients("bob", listOf("alice"), "bad evil", "*** evil")
+        assertRecipients("Bob", listOf("Alice"), "bad evil", "*** evil")
         addStopWord("evil")
-        assertRecipients("bob", listOf("alice"), "bad evil", "*** ***")
+        assertRecipients("Bob", listOf("Alice"), "bad evil", "*** ***")
 
         stopWords.pipeInput("bad", null)
         stopWords.pipeInput("bad", null)
         stopWords.pipeInput("absent", null)
         assertTrue(deliveries.isEmpty, "Rule updates must not emit deliveries")
-        assertRecipients("bob", listOf("alice"), "BAD evil", "BAD ***")
+        assertRecipients("Bob", listOf("Alice"), "BAD evil", "BAD ***")
         stopWords.pipeInput("evil", null)
         assertTrue(deliveries.isEmpty)
-        assertRecipients("bob", listOf("alice"), "BAD evil", "BAD evil")
+        assertRecipients("Bob", listOf("Alice"), "BAD evil", "BAD evil")
         addStopWord("bad")
-        assertRecipients("bob", listOf("alice"), "BAD evil", "*** evil")
+        assertRecipients("Bob", listOf("Alice"), "BAD evil", "*** evil")
     }
 
     @Test
     fun `every sender uses the same global censorship rules`() {
-        val members = listOf("alice", "bob", "stepan")
+        val members = listOf("Alice", "Bob", "Степан")
         members.forEach(::register)
         addStopWord("bad")
         for (sender in members) {
@@ -210,22 +210,22 @@ class ChatTopologyTest {
     @Test
     fun `fully censored messages still emit one envelope with final eligible recipients`() {
         addStopWord("bad")
-        assertRecipients("bob", emptyList(), "BAD", "***")
-        listOf("alice", "bob", "stepan").forEach(::register)
-        updateBlock("alice", "bob", BlockCommand.Action.BLOCK)
-        assertRecipients("bob", listOf("stepan"), "BAD", "***")
-        updateBlock("stepan", "bob", BlockCommand.Action.BLOCK)
-        assertRecipients("bob", emptyList(), "bad", "***")
-        updateBlock("alice", "bob", BlockCommand.Action.UNBLOCK)
-        assertRecipients("bob", listOf("alice"), "bad", "***")
+        assertRecipients("Bob", emptyList(), "BAD", "***")
+        listOf("Alice", "Bob", "Степан").forEach(::register)
+        updateBlock("Alice", "Bob", BlockCommand.Action.BLOCK)
+        assertRecipients("Bob", listOf("Степан"), "BAD", "***")
+        updateBlock("Степан", "Bob", BlockCommand.Action.BLOCK)
+        assertRecipients("Bob", emptyList(), "bad", "***")
+        updateBlock("Alice", "Bob", BlockCommand.Action.UNBLOCK)
+        assertRecipients("Bob", listOf("Alice"), "bad", "***")
     }
 
     @ParameterizedTest(name = "reject invalid stop word: {0}")
     @MethodSource("invalidStopWords")
     fun `invalid stop words fail processing when the table is read`(description: String, key: String, value: ByteArray) {
         stopWords.pipeInput(key, value)
-        val message = ChatMessage.newBuilder().setMessageId("m-1").setSenderId("bob").setText("Hello").build()
-        assertThrows(StreamsException::class.java, { messages.pipeInput("bob", message.toByteArray()) }, description)
+        val message = ChatMessage.newBuilder().setMessageId("m-1").setSenderId("Bob").setText("Hello").build()
+        assertThrows(StreamsException::class.java, { messages.pipeInput("Bob", message.toByteArray()) }, description)
         assertTrue(deliveries.isEmpty)
     }
 
@@ -249,23 +249,23 @@ class ChatTopologyTest {
 
     @Test
     fun `message sender must match the Kafka key`() {
-        val message = ChatMessage.newBuilder().setMessageId("m-1").setSenderId("bob").setText("Hello").build()
-        assertThrows(StreamsException::class.java) { messages.pipeInput("alice", message.toByteArray()) }
+        val message = ChatMessage.newBuilder().setMessageId("m-1").setSenderId("Bob").setText("Hello").build()
+        assertThrows(StreamsException::class.java) { messages.pipeInput("Alice", message.toByteArray()) }
         assertTrue(deliveries.isEmpty)
     }
 
     @Test
     fun `message ID must not be empty`() {
-        val message = ChatMessage.newBuilder().setSenderId("bob").setText("Hello").build()
-        assertThrows(StreamsException::class.java) { messages.pipeInput("bob", message.toByteArray()) }
+        val message = ChatMessage.newBuilder().setSenderId("Bob").setText("Hello").build()
+        assertThrows(StreamsException::class.java) { messages.pipeInput("Bob", message.toByteArray()) }
         assertTrue(deliveries.isEmpty)
     }
 
     @Test
     fun `user payload must match its registry key`() {
-        users.pipeInput("alice", User.newBuilder().setUserId("stepan").build().toByteArray())
-        val message = ChatMessage.newBuilder().setMessageId("m-1").setSenderId("bob").setText("Hello").build()
-        assertThrows(StreamsException::class.java) { messages.pipeInput("bob", message.toByteArray()) }
+        users.pipeInput("Alice", User.newBuilder().setUserId("Степан").build().toByteArray())
+        val message = ChatMessage.newBuilder().setMessageId("m-1").setSenderId("Bob").setText("Hello").build()
+        assertThrows(StreamsException::class.java) { messages.pipeInput("Bob", message.toByteArray()) }
         assertTrue(deliveries.isEmpty)
     }
 
@@ -342,18 +342,18 @@ class ChatTopologyTest {
 
         @JvmStatic
         fun invalidBlockCommands(): List<Arguments> {
-            val valid = BlockCommand.newBuilder().setBlockedSenderId("bob")
-                .setRecipientId("alice").setAction(BlockCommand.Action.BLOCK).build()
+            val valid = BlockCommand.newBuilder().setBlockedSenderId("Bob")
+                .setRecipientId("Alice").setAction(BlockCommand.Action.BLOCK).build()
             return listOf(
                 Arguments.of("null key", null, valid.toByteArray()),
                 Arguments.of("empty key", "", valid.toByteArray()),
-                Arguments.of("mismatched sender", "stepan", valid.toByteArray()),
-                Arguments.of("empty sender", "bob", valid.toBuilder().clearBlockedSenderId().build().toByteArray()),
-                Arguments.of("empty recipient", "bob", valid.toBuilder().clearRecipientId().build().toByteArray()),
-                Arguments.of("unspecified action", "bob", valid.toBuilder().clearAction().build().toByteArray()),
-                Arguments.of("unknown action", "bob", valid.toBuilder().setActionValue(99).build().toByteArray()),
-                Arguments.of("tombstone", "bob", null),
-                Arguments.of("malformed protobuf", "bob", byteArrayOf(0x80.toByte())),
+                Arguments.of("mismatched sender", "Степан", valid.toByteArray()),
+                Arguments.of("empty sender", "Bob", valid.toBuilder().clearBlockedSenderId().build().toByteArray()),
+                Arguments.of("empty recipient", "Bob", valid.toBuilder().clearRecipientId().build().toByteArray()),
+                Arguments.of("unspecified action", "Bob", valid.toBuilder().clearAction().build().toByteArray()),
+                Arguments.of("unknown action", "Bob", valid.toBuilder().setActionValue(99).build().toByteArray()),
+                Arguments.of("tombstone", "Bob", null),
+                Arguments.of("malformed protobuf", "Bob", byteArrayOf(0x80.toByte())),
             )
         }
     }
