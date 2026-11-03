@@ -59,7 +59,7 @@ class ChatCommands(
                     .setBlockedSenderId(values[1])
                     .setAction(if (action == "block") BlockCommand.Action.BLOCK else BlockCommand.Action.UNBLOCK)
                     .build()
-                listOf(ProducerRecord(ChatTopics.BLOCK_COMMANDS, command.blockedSenderId, command.toByteArray()))
+                listOf(ProducerRecord(ChatTopics.BLOCKED_USERS, command.blockedSenderId, command.toByteArray()))
             }
             "add-stop-word", "remove-stop-word" -> {
                 require(values.isNotEmpty()) { "Usage: $action <word> ..." }

@@ -23,12 +23,12 @@ private fun createTopics() {
         TopicSpec(ChatTopics.MESSAGES, ChatTopics.SENDER_PARTITIONS),
         TopicSpec(ChatTopics.USERS, ChatTopics.REFERENCE_PARTITIONS, compacted),
         TopicSpec(
-            ChatTopics.BLOCK_COMMANDS,
+            ChatTopics.BLOCKED_USERS,
             ChatTopics.SENDER_PARTITIONS,
             mapOf(TopicConfig.CLEANUP_POLICY_CONFIG to "delete", TopicConfig.RETENTION_MS_CONFIG to "-1"),
         ),
         TopicSpec(ChatTopics.STOP_WORDS, ChatTopics.REFERENCE_PARTITIONS, compacted),
-        TopicSpec(ChatTopics.DELIVERIES, ChatTopics.SENDER_PARTITIONS),
+        TopicSpec(ChatTopics.FILTERED_MESSAGES, ChatTopics.SENDER_PARTITIONS),
     )
     val properties = ChatConfig.clientProperties().apply {
         setProperty(AdminClientConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, "30000")

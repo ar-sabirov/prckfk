@@ -38,7 +38,7 @@ class ChatCommandsTest {
             commands.execute(listOf("unblock", "alice", "bob"))
             val records = producer.history()
             assertEquals(listOf("bob", "bob"), records.map { it.key() })
-            assertTrue(records.all { it.topic() == ChatTopics.BLOCK_COMMANDS })
+            assertTrue(records.all { it.topic() == ChatTopics.BLOCKED_USERS })
             val blocks = records.map { BlockCommand.parseFrom(it.value()) }
             assertTrue(blocks.all { it.blockedSenderId == "bob" && it.recipientId == "alice" })
             assertEquals(listOf(BlockCommand.Action.BLOCK, BlockCommand.Action.UNBLOCK), blocks.map { it.action })

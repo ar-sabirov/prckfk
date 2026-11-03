@@ -38,7 +38,7 @@ fun buildChatTopology(): Topology {
     // subtopology. Matching sender keys and partition counts then keep commands,
     // messages, and the sender's blocking state together in the same task.
     builder.stream(
-        ChatTopics.BLOCK_COMMANDS,
+        ChatTopics.BLOCKED_USERS,
         Consumed.with(Serdes.String(), Serdes.ByteArray()).withName("chat-block-commands-input"),
     ).processValues(
         ::BlockCommandProcessor,
@@ -57,7 +57,7 @@ fun buildChatTopology(): Topology {
         Named.`as`("select-recipients"),
         BLOCKED_BY_STORE,
     ).to(
-        ChatTopics.DELIVERIES,
+        ChatTopics.FILTERED_MESSAGES,
         Produced.with(Serdes.String(), Serdes.ByteArray()).withName("chat-deliveries"),
     )
     return builder.build()

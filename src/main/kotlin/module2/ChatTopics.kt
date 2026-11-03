@@ -1,11 +1,13 @@
 package module2
 
 object ChatTopics {
-    const val MESSAGES = "module2.chat.messages"
-    const val USERS = "module2.chat.users"
-    const val BLOCK_COMMANDS = "module2.chat.block-commands"
-    const val STOP_WORDS = "module2.chat.stop-words"
-    const val DELIVERIES = "module2.chat.deliveries"
+    // Public topic names follow assignments/module2/TASK.md.
+    const val MESSAGES = "messages"
+    const val USERS = "users"
+    // An event log of block/unblock commands, not a compacted block snapshot.
+    const val BLOCKED_USERS = "blocked_users"
+    const val STOP_WORDS = "stop_words"
+    const val FILTERED_MESSAGES = "filtered_messages"
 
     // Messages and block commands must share this count and the key partitioner.
     // Delivery output keeps the sender key and uses this count as well.

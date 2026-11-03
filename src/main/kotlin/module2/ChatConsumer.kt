@@ -29,7 +29,7 @@ fun main() {
     })
 
     try {
-        consumer.subscribe(listOf(ChatTopics.DELIVERIES))
+        consumer.subscribe(listOf(ChatTopics.FILTERED_MESSAGES))
         while (true) {
             for (record in consumer.poll(Duration.ofMillis(500))) {
                 val delivery = DeliveryEnvelope.parseFrom(record.value())

@@ -50,9 +50,9 @@ class ChatTopologyTest {
         driver = TopologyTestDriver(buildChatTopology(), properties)
         users = driver.createInputTopic(ChatTopics.USERS, StringSerializer(), ByteArraySerializer())
         messages = driver.createInputTopic(ChatTopics.MESSAGES, StringSerializer(), ByteArraySerializer())
-        blockCommands = driver.createInputTopic(ChatTopics.BLOCK_COMMANDS, StringSerializer(), ByteArraySerializer())
+        blockCommands = driver.createInputTopic(ChatTopics.BLOCKED_USERS, StringSerializer(), ByteArraySerializer())
         stopWords = driver.createInputTopic(ChatTopics.STOP_WORDS, StringSerializer(), ByteArraySerializer())
-        deliveries = driver.createOutputTopic(ChatTopics.DELIVERIES, StringDeserializer(), ByteArrayDeserializer())
+        deliveries = driver.createOutputTopic(ChatTopics.FILTERED_MESSAGES, StringDeserializer(), ByteArrayDeserializer())
     }
 
     @AfterEach
@@ -234,7 +234,7 @@ class ChatTopologyTest {
         val subtopology = buildChatTopology().describe().subtopologies().single()
         val inputTopics = subtopology.nodes().filterIsInstance<TopologyDescription.Source>()
             .flatMap { it.topicSet() }.toSet()
-        assertEquals(setOf(ChatTopics.MESSAGES, ChatTopics.BLOCK_COMMANDS), inputTopics)
+        assertEquals(setOf(ChatTopics.MESSAGES, ChatTopics.BLOCKED_USERS), inputTopics)
         val storeUsers = subtopology.nodes().filterIsInstance<TopologyDescription.Processor>()
             .filter { BLOCKED_BY_STORE in it.stores() }.map { it.name() }.toSet()
         assertEquals(setOf("apply-block-command", "select-recipients"), storeUsers)
