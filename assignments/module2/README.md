@@ -24,12 +24,12 @@ models and shared group-chat behavior are retained by agreement: the example
 | Blocked messages do not reach the blocking recipient | Implemented in `RecipientSelectionProcessor`, including directional blocks, unblocking, and multiple blockers. Other eligible recipients still receive a delivery instruction. The demo consumer logs these instructions; it is not a client messaging service. |
 | Dynamically updated censorship before delivery | Implemented with the replicated `stop_words` table and `CensorshipProcessor`. Tests cover adds, tombstones, case, punctuation, Unicode, and whole-word matching. |
 | Docker Compose and required chat topics | Implemented. Public names now match the assignment: `messages`, `filtered_messages`, `blocked_users`. Additional `users` and `stop_words` topics support the group chat. |
-| Class descriptions, launch instructions, test data | Documented below, with topology fixtures and SQL fixtures. Exact chat texts are currently exercised through `TopologyTestDriver`; the live producer uses downloaded sentences. A reproducible full broker scenario is still step 10. |
+| Class descriptions, launch instructions, test data | Documented below, with an example scenario, topology tests, and commands for changing users and rules. Exact chat texts are exercised through `TopologyTestDriver`; the live producer uses downloaded sentences. A reproducible full broker scenario is still step 10. |
 | ksqlDB source stream `messages_stream` | Registered over raw `messages` in `ksqldb/ksqldb-queries.sql`. The current analytics deliberately use the separate `FILTERED_MESSAGES_STREAM` over final delivery decisions. |
 | Total message count across all users | Implemented in `GLOBAL_MESSAGE_COUNTS` by summing current `USER_MESSAGE_COUNTS` table rows. Replacing a sender's total replaces their contribution; it does not add the full total again. |
 | Unique recipient count across all users | Implemented in `GLOBAL_RECIPIENT_COUNTS` by counting rows of `GLOBAL_RECIPIENTS`, keyed only by recipient. Users reached by multiple senders count once. |
 | Per-user message and unique-recipient counts, stored for queries | Implemented in `USER_STATISTICS`, backed by `user_statistics`. Messages with empty recipient lists still count; repeated sender-recipient pairs do not increase uniqueness. |
-| SQL file and test queries | `ksqldb/ksqldb-queries.sql` contains both source declarations and all per-user/global queries. Three SQL scenarios cover repeated recipients, cross-sender overlap, empty deliveries, and fully censored messages; verification queries are below. |
+| SQL file and test queries | `ksqldb/ksqldb-queries.sql` contains both source declarations and all per-user/global queries. Verification queries for message counts and unique-recipient counts are below. |
 
 Counts describe processed chat messages and eligible recipients, not client
 acknowledgements. There is currently one output envelope per processed message.
@@ -47,12 +47,11 @@ assignment's `user_statistics` table; its Kafka topic is lowercase.
 Application IDs, processor names, and local `chat-*` store names are internal
 identifiers, not additional public topics.
 
-Validation of the renamed source (2026-11-03): Docker's Maven `verify` build
+Development verification (2026-11-03): Docker's Maven `verify` build
 passed all 54 JVM tests (43 topology, 7 censorship, 4 command tests). The ksqlDB
-8.1.6 SQL test runner passed all three statistics scenarios with the renamed
-objects and both source declarations in a network-isolated container. Compose
-configuration also validated. These checks do not verify live restart recovery, multiple
-instances, or migration of the existing broker's data.
+8.1.6 checks passed the per-user, global, and initially empty-recipient scenarios.
+Compose configuration also validated. These checks did not verify live restart
+recovery, multiple instances, or migration of the existing broker's data.
 
 ### Existing installations after the rename
 
@@ -393,10 +392,6 @@ Application sources use package `module2` and live directly in
 | [ChatConsumer.kt](../../src/main/kotlin/module2/ChatConsumer.kt) | Subscribe to deliveries, decode each envelope, and log its message and recipients. |
 | [docker-compose.yml](docker-compose.yml) | Run Kafka, Kafka UI, ksqlDB, a one-shot topic initializer, producer, Streams, and consumer services; provide an on-demand command runner. |
 | [ksqldb-queries.sql](ksqldb/ksqldb-queries.sql) | Register raw input and filtered output streams; continuously calculate per-sender and global message and exact unique-recipient counts. |
-| [per-user-statistics-test.sql](ksqldb/per-user-statistics-test.sql) | Verify repeated recipients, unblocking, independent senders, and empty recipient lists with the ksqlDB SQL test runner. |
-| [global-statistics-test.sql](ksqldb/global-statistics-test.sql) | Verify the complete scenario's global totals, recipient overlap across senders, and preservation of history after empty deliveries. |
-| [empty-recipient-statistics-test.sql](ksqldb/empty-recipient-statistics-test.sql) | Verify global zero-recipient counts before any recipient has been reached, followed by the first eligible recipient. |
-| [test-statistics.sh](ksqldb/test-statistics.sh) | Run each SQL fixture against a fresh copy of the complete query setup and fail if any scenario fails. |
 | [ChatTopologyTest.kt](../../src/test/kotlin/module2/ChatTopologyTest.kt) | Test membership, blocking, censorship, rule changes, topology connections, and validation without a broker. |
 | [CensorshipTest.kt](../../src/test/kotlin/module2/CensorshipTest.kt) | Test locale-independent normalization and rejection of invalid stop-word input. |
 | [ChatCommandsTest.kt](../../src/test/kotlin/module2/ChatCommandsTest.kt) | Test command records and validation without a broker. |
@@ -666,17 +661,8 @@ and transactional recovery guarantees are not implemented here (see step 9).
 Future delivery batching must preserve a separate once-per-message input for
 the message-count query.
 
-To verify all three SQL scenarios without writing test events to the running
-broker, run the test script in a temporary container. Each fixture receives its
-own fresh query setup:
-
-```bash
-docker-compose run --rm --no-deps -v "$PWD/ksqldb:/sql:ro" \
-  --entrypoint /bin/bash ksqldb /sql/test-statistics.sh
-```
-
 Historical checkpoint before the naming cleanup, verified on 2026-11-03 with
-ksqlDB 8.1.6: the SQL test passes Bob's `2/1` then
+ksqlDB 8.1.6: checks passed Bob's `2/1` then
 `3/2` checkpoint, independent Stepan counts, fully censored text, an initially
 empty recipient list, and preservation of historical reach after an empty
 delivery. All five live queries were created, and the combined table returned
@@ -734,12 +720,12 @@ no new recipient-array expansion, though repeated selections still propagate
 table updates. A single global key limits throughput to one aggregation task;
 additional partitions cannot distribute that one counter.
 
-Verified step-8 checkpoint (2026-11-03, ksqlDB 8.1.6): all three SQL scenarios
-passed. The complete Alice/Bob/Stepan example reaches **4 messages / 3 unique
+Verified step-8 checkpoint (2026-11-03, ksqlDB 8.1.6): development checks passed
+all three statistics scenarios. The complete Alice/Bob/Stepan example reaches **4 messages / 3 unique
 recipients**, with Bob at `3/2` and Stepan at `1/2`. Two additional empty
 deliveries bring the global result to `6/3`. A separate fresh-state scenario
 verifies `1/0`, `2/0`, then `3/1` when the first recipient becomes eligible.
-These fixtures insert final Protobuf delivery decisions; the topology tests
+These checks used final Protobuf delivery decisions; the topology tests
 separately verify the censorship and blocking that produce those decisions.
 
 The complete setup was also applied to the running `kafka-module2-task-names`
@@ -991,7 +977,7 @@ docker-compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
   and recovery verification are part of step 9.
 
 The demo now illustrates transport, censorship, recipient selection, and blocking.
-The SQL tests above verify the scenario's per-sender and global counters.
+The SQL queries above let the reviewer inspect per-sender and global counters.
 The producer supplies message text; all business processing runs in the Streams
 application.
 
