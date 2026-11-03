@@ -140,8 +140,8 @@ many senders can share one partition.
 Messages and block commands are event logs. In particular, do not compact block
 commands by sender ID: Alice's block of Bob and Stepan's block of Bob are separate
 commands with the same key. Keeping only the latest command would lose part of
-the blocking state when rebuilding it. The application will aggregate commands
-into its inverse blocking index in step 5.
+the blocking state when rebuilding it. The application aggregates commands into
+its inverse blocking index in step 5.
 
 Users and stop words describe current state. A non-null record creates or
 replaces the entry for its key. A tombstone is a Kafka record with a key and a
@@ -237,20 +237,26 @@ Kotlin compiler in the Maven process. Generated sources live under
 `target/generated-sources/protobuf`; edit the `.proto` definitions rather than
 those generated files.
 
-## Running step 4
+## Running steps 4 and 5
 
-The current topology selects recipients from the user registry:
+The current topology selects recipients from the user registry and applies
+directional blocking:
 
 ```text
 module2.chat.users -> GlobalKTable (local copy on each Streams instance)
                                       |
 producer -> module2.chat.messages -> chat (Kafka Streams) -> module2.chat.deliveries -> consumer
+                                      |
+                               chat-blocked-by (local store per task)
+                                      |
+module2.chat.block-commands -> BlockCommandProcessor
 ```
 
 It parses each `ChatMessage` and wraps it in a `DeliveryEnvelope`, preserving
 the sender key and the message fields. The recipients are all currently
-registered users except the sender. Blocking, censorship, and statistics follow
-in later steps; the stop-word topic is not consumed yet.
+registered users except the sender and those who have blocked that sender.
+Censorship and statistics follow in later steps; the stop-word topic is not
+consumed yet.
 
 ### User registry and recipient selection
 
@@ -260,14 +266,16 @@ user topic and maintains its own complete copy. This lets any message task
 select recipients locally, regardless of which sender partitions it owns.
 
 `RecipientSelectionProcessor` reads that store for each message, excludes the
-sender, and forwards one envelope. A normal table join looks up a value for one
-key; recipient selection needs to enumerate the membership instead. The fixed-key
-processor keeps the sender key, so this operation requires no repartitioning.
+sender and blocked recipients, and forwards one envelope. A normal table join
+looks up a value for one key; recipient selection needs to enumerate the
+membership instead. The fixed-key processor keeps the sender key, so this
+operation requires no repartitioning.
 
 Registering the same ID again replaces its entry; it does not create a duplicate
 recipient. A tombstone removes the entry. A user can receive messages without
 having sent any. An empty registry, or one containing only the sender, still
-produces one envelope with `recipients=[]`. Recipient order is not a contract.
+produces one envelope with `recipients=[]`, as does a message blocked by every
+other member. Recipient order is not a contract.
 
 Selection scans the registry and includes the recipient IDs in the envelope, so
 its work and output size grow with membership. It avoids producing a separate
@@ -286,16 +294,17 @@ Application sources use package `module2` and live directly in
 
 | File | Responsibility |
 | --- | --- |
-| [ChatTopology.kt](../../src/main/kotlin/module2/ChatTopology.kt) | Build the global user table and connect message input, recipient selection, and delivery output. |
-| [RecipientSelectionProcessor.kt](../../src/main/kotlin/module2/RecipientSelectionProcessor.kt) | Read local membership, exclude the sender, and emit one delivery envelope. |
+| [ChatTopology.kt](../../src/main/kotlin/module2/ChatTopology.kt) | Build the global user table, connect both sender-keyed inputs to the blocking store, and wire delivery output. |
+| [BlockCommandProcessor.kt](../../src/main/kotlin/module2/BlockCommandProcessor.kt) | Validate block/unblock commands and maintain the inverse blocking index. |
+| [RecipientSelectionProcessor.kt](../../src/main/kotlin/module2/RecipientSelectionProcessor.kt) | Read membership and blocking state, exclude ineligible recipients, and emit one delivery envelope. |
 | [ChatConfig.kt](../../src/main/kotlin/module2/ChatConfig.kt) | Configure the broker connection, application ID, stream thread, offsets, and state directory. |
 | [ChatApplication.kt](../../src/main/kotlin/module2/ChatApplication.kt) | Print the topology, start Kafka Streams, report state transitions, and close on shutdown. |
-| [ChatTopicSetup.kt](../../src/main/kotlin/module2/ChatTopicSetup.kt) | Create and check topics, then seed demo users; accept `add`/`remove` commands for membership changes. |
+| [ChatTopicSetup.kt](../../src/main/kotlin/module2/ChatTopicSetup.kt) | Create and check topics, seed demo users, and publish `add`/`remove` and `block`/`unblock` commands. |
 | [ChatProducer.kt](../../src/main/kotlin/module2/ChatProducer.kt) | Continuously send sentences as Alice, Bob, and Stepan in round-robin order. |
 | [SentenceSource.kt](../../src/main/kotlin/module2/SentenceSource.kt) | Download plain text once and split it into sentences. |
 | [ChatConsumer.kt](../../src/main/kotlin/module2/ChatConsumer.kt) | Subscribe to deliveries, decode each envelope, and log its message and recipients. |
 | [docker-compose.yml](docker-compose.yml) | Run Kafka, topic and user setup, and separate producer, Streams, and consumer processes. |
-| [ChatTopologyTest.kt](../../src/test/kotlin/module2/ChatTopologyTest.kt) | Test membership changes, recipient selection, and validation without a broker. |
+| [ChatTopologyTest.kt](../../src/test/kotlin/module2/ChatTopologyTest.kt) | Test membership, blocking, topology connections, and validation without a broker. |
 
 The local broker uses KRaft with broker and controller roles in one process and
 replication factor 1. It exposes `localhost:19092` for host clients; containers
@@ -334,9 +343,9 @@ Consumed topic=module2.chat.deliveries partition=<n> offset=<output-offset> key=
 
 Compare the same `messageId` in both logs to see its journey through the app.
 The consumer prints every record; it does not filter for a particular ID or
-perform assertions. With the three demo users registered, each message has the
-other two users as recipients. Text is unchanged at this step. Censorship starts
-in step 6.
+perform assertions. With the three demo users registered and no blocks, each
+message has the other two users as recipients. Text is unchanged at this step.
+Censorship starts in step 6.
 
 ### Change membership while the demo runs
 
@@ -373,6 +382,71 @@ the three demo users. The `add` and `remove` commands only update the specified
 users; they do not run the default setup. Each Compose startup that runs
 `kafka-init` re-registers the demo users. Other memberships persist in the
 compacted topic until removed with tombstones.
+
+### Blocking state and task locality
+
+`BlockCommandProcessor` maintains `chat-blocked-by`, a persistent key-value store
+with a Kafka changelog. Its key is the blocked sender ID; its value is an internal
+`BlockedRecipients` Protobuf containing the set of recipients who blocked that
+sender. For example, Alice's block of Bob adds `alice` to `blockedBy["bob"]`.
+Stepan's block of Bob adds another member without replacing Alice's choice.
+`UNBLOCK` removes only the issuing recipient, and the last removal deletes the
+store entry. Repeating either action leaves the set unchanged.
+
+Both processors explicitly connect to this same store in `ChatTopology`. That
+connection places message input and block-command input in one subtopology.
+With matching keys, serializers, partitioning, and three partitions on both
+topics, each task owns the corresponding input partition from each topic and
+its part of the blocking index. No repartition topic is needed. Merely giving
+two independent streams the same keys would not connect their tasks.
+See Kafka's [task and state-store architecture](https://kafka.apache.org/41/streams/architecture/).
+
+For Bob's message, recipient selection reads `blockedBy["bob"]` once, converts
+it to a set, and excludes those IDs while scanning the user registry. Alice's
+block of Bob does not stop Bob from receiving Alice's messages or stop Stepan
+from receiving Bob's messages. Blocking does not change membership; blocks can
+exist before registration and persist through removal and re-registration.
+
+Commands emit no deliveries. They must have a non-empty key equal to
+`blocked_sender_id`, a non-empty `recipient_id`, and action `BLOCK` or `UNBLOCK`.
+Null values, malformed Protobuf, unspecified actions, and unknown actions fail
+processing. A tombstone is not an unblock command. The command topic retains
+the full event history; the compacted internal changelog can instead retain
+the latest complete blocking set for each sender.
+
+### Apply a block and unblock
+
+With the demo running, execute from `assignments/module2`:
+
+```bash
+docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt block alice bob
+docker-compose logs -f --tail=10 consumer
+```
+
+Arguments are **recipient first, blocked sender second**: Alice blocks Bob.
+The command publishes a `BlockCommand` with key `bob`. After Streams applies it,
+Bob's subsequent messages target `[stepan]`. Alice's messages still target
+`[bob, stepan]`, and Stepan's target `[alice, bob]`, assuming no other blocks.
+Stop following logs with Ctrl-C, then restore Alice's eligibility:
+
+```bash
+docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt unblock alice bob
+docker-compose logs -f --tail=10 consumer
+```
+
+After the unblock is applied, Bob's messages again target `[alice, stepan]`.
+Repeating these commands is safe. Default topic setup does not clear blocks;
+use explicit `unblock` commands to remove blocks left by earlier demo runs.
+The `block` and `unblock` commands only publish their requested update; they do
+not run topic setup or register users.
+
+A producer acknowledgement means Kafka accepted the command, not that Streams
+applied it. Messages use the state available **when processed**. Messages and
+commands for Bob share a partition number and task, but belong to different
+topic-partitions, each with its own offsets and ordering. Neither matching keys
+nor publishing a block first establishes a total order across those inputs.
+Check subsequent delivery logs for the effect; earlier envelopes stay unchanged.
+The topology tests explicitly pipe each update before the message it must affect.
 
 ### Sentence source and sender rotation
 
@@ -440,10 +514,11 @@ docker-compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
 - **Application ID:** `module2-chat` identifies this Streams application and its
   consumer group. Instances with the same ID share the work and committed input
   offsets. Changing the ID starts an independent application.
-- **Tasks:** the message input has three partitions, producing three tasks for
-  this topology. One configured stream thread handles those tasks; three tasks
-  do not mean three application processes or three threads. A separate global
-  thread maintains the complete user registry for the instance.
+- **Tasks:** messages and block commands each have three partitions. Their
+  shared store connects them into three tasks, each owning the same partition
+  number from both topics. One configured stream thread handles those tasks;
+  three tasks do not mean three application processes or three threads. A
+  separate global thread maintains the complete user registry for the instance.
 - **Partition and order:** each sender's key selects an input partition. The
   unchanged key and matching output partition count select the same partition
   number for the delivery envelope. Different senders can share a partition.
@@ -459,12 +534,12 @@ docker-compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
   A failure can cause an input to be processed again. Transactional processing
   and recovery verification are part of step 9.
 
-The demo now illustrates transport and recipient selection. The full
-Alice/Bob/Stepan scenario becomes runnable as blocking, censorship, and statistics
+The demo now illustrates transport, recipient selection, and blocking. The full
+Alice/Bob/Stepan scenario becomes runnable as censorship and statistics
 are implemented. The producer supplies message text; all business processing
 runs in the Streams application.
 
-### Test recipient selection
+### Test recipient selection and blocking
 
 From the repository root, with JDK 21 and Maven available:
 
@@ -476,14 +551,26 @@ The JUnit tests use Kafka's `TopologyTestDriver` with the real topology and
 Protobuf records. They cover exclusion of the sender, exactly one envelope per
 message, joining users, repeated registrations, tombstones and re-registration,
 empty recipient lists, preserved message fields, and invalid IDs or keys.
+Blocking tests cover the step-5 checkpoint, its direction, multiple blockers,
+repeated commands, independent senders, membership changes, and invalid commands.
+A topology-description assertion checks that both inputs and both processors
+share the blocking store in one subtopology without a repartition source.
 The driver applies global-table input synchronously; the live demo has the
 asynchronous update timing described above.
 
-Verified checkpoint (2026-11-03): all seven topology tests passed locally and
+Verified step-4 checkpoint (2026-11-03): all seven topology tests passed locally and
 in the Docker image's Maven `verify` build. The live demo restored the three
 seeded users and selected the other two users for each sender. After publishing
 Stepan's tombstone, Bob's recipient list changed from `[alice, stepan]` to
 `[alice]`. Re-registering Stepan restores the original membership.
+
+Verified step-5 checkpoint (2026-11-03): all 21 topology test cases passed in the
+Docker image's Maven `verify` build. After Alice's block was applied, Bob targeted
+only Stepan, while Alice still targeted Bob and Stepan and Stepan still targeted
+Alice and Bob. Unblocking restored Alice's eligibility for Bob's messages.
+The topology check confirmed both sender-keyed inputs share the blocking store.
+This checkpoint used `TopologyTestDriver`; it does not verify live cross-topic
+timing or recovery, which remains part of step 9.
 
 Stop the module-2 services with:
 
@@ -545,7 +632,7 @@ progresses.
     Alice and Stepan. Explain how the envelope avoids a separate message record
     for every recipient.
 
-- [ ] **5. Implement blocking.**
+- [x] **5. Implement blocking.**
 
     Build the inverse index `blocked sender -> users who blocked that sender`
     and apply it during recipient selection. Add focused topology tests for

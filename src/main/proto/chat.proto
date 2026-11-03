@@ -32,6 +32,12 @@ message BlockCommand {
   Action action = 3;
 }
 
+// Internal state-store value, keyed by blocked sender ID. These recipients have
+// blocked that sender. The processor maintains set semantics for recipient_ids.
+message BlockedRecipients {
+  repeated string recipient_ids = 1;
+}
+
 // Current stop-word entry. Both word and the Kafka key use the same normalized,
 // case-insensitive form. A Kafka tombstone removes the entry.
 message StopWord {

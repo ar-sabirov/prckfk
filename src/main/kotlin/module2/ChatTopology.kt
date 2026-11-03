@@ -1,16 +1,16 @@
 package module2
 
 import org.apache.kafka.common.serialization.Serdes
-import org.apache.kafka.common.utils.Bytes
 import org.apache.kafka.streams.StreamsBuilder
 import org.apache.kafka.streams.Topology
 import org.apache.kafka.streams.kstream.Consumed
 import org.apache.kafka.streams.kstream.Materialized
 import org.apache.kafka.streams.kstream.Named
 import org.apache.kafka.streams.kstream.Produced
-import org.apache.kafka.streams.state.KeyValueStore
+import org.apache.kafka.streams.state.Stores
 
 const val USERS_STORE = "chat-users"
+const val BLOCKED_BY_STORE = "chat-blocked-by"
 
 fun buildChatTopology(): Topology {
     val builder = StreamsBuilder()
@@ -21,12 +21,32 @@ fun buildChatTopology(): Topology {
         Materialized.`as`(USERS_STORE),
     )
 
+    builder.addStateStore(
+        Stores.keyValueStoreBuilder(
+            Stores.persistentKeyValueStore(BLOCKED_BY_STORE),
+            Serdes.String(),
+            Serdes.ByteArray(),
+        ),
+    )
+    // Connecting both processors to this store puts both sources in the same
+    // subtopology. Matching sender keys and partition counts then keep commands,
+    // messages, and the sender's blocking state together in the same task.
+    builder.stream(
+        ChatTopics.BLOCK_COMMANDS,
+        Consumed.with(Serdes.String(), Serdes.ByteArray()).withName("chat-block-commands-input"),
+    ).processValues(
+        ::BlockCommandProcessor,
+        Named.`as`("apply-block-command"),
+        BLOCKED_BY_STORE,
+    )
+
     builder.stream(
         ChatTopics.MESSAGES,
         Consumed.with(Serdes.String(), Serdes.ByteArray()).withName("chat-input"),
     ).processValues(
         ::RecipientSelectionProcessor,
         Named.`as`("select-recipients"),
+        BLOCKED_BY_STORE,
     ).to(
         ChatTopics.DELIVERIES,
         Produced.with(Serdes.String(), Serdes.ByteArray()).withName("chat-deliveries"),

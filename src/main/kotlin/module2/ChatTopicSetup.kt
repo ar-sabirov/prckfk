@@ -1,5 +1,6 @@
 package module2
 
+import module2.proto.BlockCommand
 import module2.proto.User
 import org.apache.kafka.clients.admin.AdminClient
 import org.apache.kafka.clients.admin.AdminClientConfig
@@ -25,12 +26,21 @@ fun main(args: Array<String>) {
         return
     }
 
-    require(args.size >= 2 && args[0] in setOf("add", "remove")) {
-        "Usage: module2.ChatTopicSetupKt [<add|remove> <user-id> ...]"
+    val usage = "Usage: module2.ChatTopicSetupKt [<add|remove> <user-id> ... | <block|unblock> <recipient-id> <sender-id>]"
+    when (args[0]) {
+        "add", "remove" -> {
+            require(args.size >= 2) { usage }
+            val userIds = args.drop(1)
+            require(userIds.all { it.isNotEmpty() }) { "User IDs must not be empty" }
+            updateUsers(args[0], userIds)
+        }
+        "block", "unblock" -> {
+            require(args.size == 3) { usage }
+            require(args[1].isNotEmpty() && args[2].isNotEmpty()) { "Recipient and sender IDs must not be empty" }
+            updateBlock(args[0], recipientId = args[1], senderId = args[2])
+        }
+        else -> throw IllegalArgumentException(usage)
     }
-    val userIds = args.drop(1)
-    require(userIds.all { it.isNotEmpty() }) { "User IDs must not be empty" }
-    updateUsers(args[0], userIds)
 }
 
 private fun createTopics() {
@@ -84,5 +94,22 @@ private fun updateUsers(action: String, userIds: List<String>) {
             val metadata = producer.send(ProducerRecord(ChatTopics.USERS, userId, value)).get(30, TimeUnit.SECONDS)
             println("Published user $action key=$userId topic=${metadata.topic()} offset=${metadata.offset()}")
         }
+    }
+}
+
+private fun updateBlock(action: String, recipientId: String, senderId: String) {
+    val command = BlockCommand.newBuilder()
+        .setBlockedSenderId(senderId)
+        .setRecipientId(recipientId)
+        .setAction(if (action == "block") BlockCommand.Action.BLOCK else BlockCommand.Action.UNBLOCK)
+        .build()
+    KafkaProducer(ChatConfig.producerProperties(), StringSerializer(), ByteArraySerializer()).use { producer ->
+        val metadata = producer.send(
+            ProducerRecord(ChatTopics.BLOCK_COMMANDS, senderId, command.toByteArray()),
+        ).get(30, TimeUnit.SECONDS)
+        println(
+            "Published $action recipient=$recipientId sender=$senderId key=$senderId " +
+                "topic=${metadata.topic()} partition=${metadata.partition()} offset=${metadata.offset()}",
+        )
     }
 }
