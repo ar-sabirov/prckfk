@@ -166,7 +166,9 @@ state needed by a table. Removing a user does not erase historical statistics.
   surrounding whitespace and lowercasing with `Locale.ROOT`; use the resulting
   word as both key and value field. For example, an entry of `BAD` is stored
   under `bad`. Censorship will apply the matching normalization to message words
-  while preserving the surrounding original text.
+  while preserving the surrounding original text. A word is a contiguous run
+  of Unicode letters, combining marks, numbers, or underscores. Punctuation
+  and whitespace separate words; phrases and punctuation are not valid entries.
 - `DeliveryEnvelope` contains the message with censored text and distinct
   `recipient_ids` excluding the sender. Its Kafka key remains the sender ID,
   not a recipient ID. Initially, emit one envelope per message, including an
@@ -202,9 +204,8 @@ same task. Matching topic keys alone does not connect independent topologies.
 
 That task can maintain `blockedBy["bob"] = {"alice"}` and look it up locally for
 Bob's messages. His per-sender statistics can also be maintained in that task.
-The user registry is replicated to every Streams instance; the stop-word table
-will follow in step 6. Their partition counts do not need to match the
-sender-partitioned inputs.
+The user registry and stop-word table are replicated to every Streams instance.
+Their partition counts do not need to match the sender-partitioned inputs.
 
 After the block and the stop word `bad` are applied, with Alice, Bob, and Stepan
 registered, the eventual delivery record is:
@@ -217,7 +218,7 @@ value:
   recipient_ids: "stepan"
 ```
 
-This is the expected output once steps 4–6 are implemented. Equal partition
+This is the expected output with steps 4–6 implemented. Equal partition
 numbers do not establish ordering between the message and block-command topics;
 the block must have been applied before processing the message for this example
 to hold. Do not explicitly choose different partitions for these related keys
@@ -237,26 +238,29 @@ Kotlin compiler in the Maven process. Generated sources live under
 `target/generated-sources/protobuf`; edit the `.proto` definitions rather than
 those generated files.
 
-## Running steps 4 and 5
+## Running steps 4–6
 
-The current topology selects recipients from the user registry and applies
-directional blocking:
+The current topology censors messages, selects recipients from the user
+registry, and applies directional blocking:
 
 ```text
-module2.chat.users -> GlobalKTable (local copy on each Streams instance)
-                                      |
-producer -> module2.chat.messages -> chat (Kafka Streams) -> module2.chat.deliveries -> consumer
-                                      |
-                               chat-blocked-by (local store per task)
-                                      |
-module2.chat.block-commands -> BlockCommandProcessor
+messages -> CensorshipProcessor -> RecipientSelectionProcessor -> deliveries
+                    ^                       ^             ^
+             chat-stop-words           chat-users    chat-blocked-by
+              (global table)         (global table)   (task-local store)
+                    ^                       ^             ^
+                stop-words                users     BlockCommandProcessor
+                                                          ^
+                                                    block-commands
 ```
 
-It parses each `ChatMessage` and wraps it in a `DeliveryEnvelope`, preserving
-the sender key and the message fields. The recipients are all currently
-registered users except the sender and those who have blocked that sender.
-Censorship and statistics follow in later steps; the stop-word topic is not
-consumed yet.
+Topic names in the diagram omit the `module2.chat.` prefix. The producer and
+delivery consumer still run as separate processes.
+
+The topology parses each `ChatMessage`, censors its text, and wraps it in a
+`DeliveryEnvelope`, preserving the sender key and message ID. Recipients are all
+currently registered users except the sender and those who have blocked that sender.
+Statistics follow in later steps.
 
 ### User registry and recipient selection
 
@@ -294,17 +298,22 @@ Application sources use package `module2` and live directly in
 
 | File | Responsibility |
 | --- | --- |
-| [ChatTopology.kt](../../src/main/kotlin/module2/ChatTopology.kt) | Build the global user table, connect both sender-keyed inputs to the blocking store, and wire delivery output. |
+| [ChatTopology.kt](../../src/main/kotlin/module2/ChatTopology.kt) | Build the global user and stop-word tables, place censorship before recipient selection, and connect both sender-keyed inputs to the blocking store. |
+| [CensorshipProcessor.kt](../../src/main/kotlin/module2/CensorshipProcessor.kt) | Read and validate global stop-word state and transform each message's text. |
+| [Censorship.kt](../../src/main/kotlin/module2/Censorship.kt) | Normalize stop-word entries and replace matching whole words while preserving separators. |
 | [BlockCommandProcessor.kt](../../src/main/kotlin/module2/BlockCommandProcessor.kt) | Validate block/unblock commands and maintain the inverse blocking index. |
 | [RecipientSelectionProcessor.kt](../../src/main/kotlin/module2/RecipientSelectionProcessor.kt) | Read membership and blocking state, exclude ineligible recipients, and emit one delivery envelope. |
 | [ChatConfig.kt](../../src/main/kotlin/module2/ChatConfig.kt) | Configure the broker connection, application ID, stream thread, offsets, and state directory. |
 | [ChatApplication.kt](../../src/main/kotlin/module2/ChatApplication.kt) | Print the topology, start Kafka Streams, report state transitions, and close on shutdown. |
-| [ChatTopicSetup.kt](../../src/main/kotlin/module2/ChatTopicSetup.kt) | Create and check topics, seed demo users, and publish `add`/`remove` and `block`/`unblock` commands. |
+| [ChatTopicSetup.kt](../../src/main/kotlin/module2/ChatTopicSetup.kt) | Create and validate topics, then exit. |
+| [ChatCommands.kt](../../src/main/kotlin/module2/ChatCommands.kt) | Run one command from process arguments, publish membership/blocking/stop-word updates, and exit. |
 | [ChatProducer.kt](../../src/main/kotlin/module2/ChatProducer.kt) | Continuously send sentences as Alice, Bob, and Stepan in round-robin order. |
 | [SentenceSource.kt](../../src/main/kotlin/module2/SentenceSource.kt) | Download plain text once and split it into sentences. |
 | [ChatConsumer.kt](../../src/main/kotlin/module2/ChatConsumer.kt) | Subscribe to deliveries, decode each envelope, and log its message and recipients. |
-| [docker-compose.yml](docker-compose.yml) | Run Kafka, topic and user setup, and separate producer, Streams, and consumer processes. |
-| [ChatTopologyTest.kt](../../src/test/kotlin/module2/ChatTopologyTest.kt) | Test membership, blocking, topology connections, and validation without a broker. |
+| [docker-compose.yml](docker-compose.yml) | Run Kafka, a one-shot topic initializer, producer, Streams, and consumer services; provide an on-demand command runner. |
+| [ChatTopologyTest.kt](../../src/test/kotlin/module2/ChatTopologyTest.kt) | Test membership, blocking, censorship, rule changes, topology connections, and validation without a broker. |
+| [CensorshipTest.kt](../../src/test/kotlin/module2/CensorshipTest.kt) | Test locale-independent normalization and rejection of invalid stop-word input. |
+| [ChatCommandsTest.kt](../../src/test/kotlin/module2/ChatCommandsTest.kt) | Test command records and validation without a broker. |
 
 The local broker uses KRaft with broker and controller roles in one process and
 replication factor 1. It exposes `localhost:19092` for host clients; containers
@@ -320,14 +329,50 @@ commands from `assignments/module2`:
 docker-compose up --build -d
 docker-compose ps -a
 docker-compose logs --tail=50 kafka-init chat
-docker-compose logs -f --tail=10 producer consumer
 ```
 
 The broker must become healthy; `kafka-init` creates and checks the topics, then
-registers Alice, Bob, and Stepan and exits with code 0. Only then does `chat`
-start. Kafka Streams restores the global user table before starting message
-processing, so the demo's initial membership is available without an arbitrary
-sleep. `chat` must reach `RUNNING`.
+exits with code 0. `chat` depends on its successful completion.
+`kafka-init` has no restart loop and publishes no users or rules. It is a
+one-shot job, not an exactly-once-ever operation: Compose may run it again on
+later startups or recreation. Repeating it safely validates existing topics.
+See Docker's [startup dependency conditions](https://docs.docker.com/compose/how-tos/startup-order/).
+
+Kafka Streams restores the global user and stop-word tables before message
+processing. Retained membership and rules therefore survive startup; `chat`
+must reach `RUNNING`. On a fresh broker, register the demo users with:
+
+```bash
+docker-compose run --rm --no-deps commands add alice bob stepan
+```
+
+`ChatCommandsKt` runs one command per invocation: read arguments, validate the
+command, send its records, wait for Kafka acknowledgements, close the producer,
+and exit. Your shell handles quoting and escaping. There is no input loop or
+custom command-line parser. Invalid commands and send failures exit nonzero.
+Multiple sends are not a transaction; a broker failure can leave some updates
+acknowledged. Publishing an update does not wait for Streams to apply it.
+
+The `commands` service has the `tools` profile, so normal `docker-compose up`
+does not start it. Explicit `docker-compose run commands ...` makes it available
+without enabling the profile separately. `--rm` removes the temporary container
+after it exits; `--no-deps` reuses the running stack without rerunning topic setup.
+See Docker's [on-demand services with profiles](https://docs.docker.com/compose/how-tos/profiles/).
+The entrypoint fixes the Java launcher and `ChatCommandsKt`, leaving the command
+arguments replaceable. No `stdin_open` or `tty` settings are needed.
+
+Run with `help` or no arguments to print available commands without creating a
+Kafka producer:
+
+```bash
+docker-compose run --rm --no-deps commands help
+```
+
+Observe messages in another terminal:
+
+```bash
+docker-compose logs -f --tail=10 producer consumer
+```
 
 The `producer` and `consumer` services keep running until stopped. Each uses its
 own Kafka client; neither runs inside the Streams process.
@@ -344,16 +389,16 @@ Consumed topic=module2.chat.deliveries partition=<n> offset=<output-offset> key=
 Compare the same `messageId` in both logs to see its journey through the app.
 The consumer prints every record; it does not filter for a particular ID or
 perform assertions. With the three demo users registered and no blocks, each
-message has the other two users as recipients. Text is unchanged at this step.
-Censorship starts in step 6.
+message has the other two users as recipients. Configured stop words appear as
+`***` in the output text. On a fresh broker, messages initially have no recipients
+until registration is applied. Topic setup seeds neither users nor stop words.
 
 ### Change membership while the demo runs
 
-Run these commands from `assignments/module2`:
+From `assignments/module2`, remove Stepan:
 
 ```bash
-docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt remove stepan
-docker-compose logs -f --tail=10 consumer
+docker-compose run --rm --no-deps commands remove stepan
 ```
 
 Once the tombstone has been applied, Bob's messages target only Alice. The
@@ -361,14 +406,14 @@ producer continues cycling through its three sender IDs; membership controls
 recipient selection. Restore Stepan with:
 
 ```bash
-docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt add stepan
+docker-compose run --rm --no-deps commands add stepan
 ```
 
 You can also register a user who never sends a message, then remove them:
 
 ```bash
-docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt add dana
-docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt remove dana
+docker-compose run --rm --no-deps commands add dana
+docker-compose run --rm --no-deps commands remove dana
 ```
 
 The command waits for Kafka to acknowledge the update. The global table consumes
@@ -377,11 +422,10 @@ instance has applied it yet. Observe subsequent delivery logs to see the change.
 Membership changes do not emit deliveries or modify earlier envelopes. Tests
 apply user updates before the corresponding messages explicitly.
 
-Running `ChatTopicSetupKt` without arguments creates/checks topics and registers
-the three demo users. The `add` and `remove` commands only update the specified
-users; they do not run the default setup. Each Compose startup that runs
-`kafka-init` re-registers the demo users. Other memberships persist in the
-compacted topic until removed with tombstones.
+`ChatTopicSetupKt` only creates/checks topics and accepts no runtime commands.
+The `add` and `remove` commands only update the specified users. Topic setup does
+not re-register anyone; membership persists in the compacted topic until
+explicitly changed by a command.
 
 ### Blocking state and task locality
 
@@ -419,19 +463,17 @@ the latest complete blocking set for each sender.
 With the demo running, execute from `assignments/module2`:
 
 ```bash
-docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt block alice bob
-docker-compose logs -f --tail=10 consumer
+docker-compose run --rm --no-deps commands block alice bob
 ```
 
 Arguments are **recipient first, blocked sender second**: Alice blocks Bob.
 The command publishes a `BlockCommand` with key `bob`. After Streams applies it,
 Bob's subsequent messages target `[stepan]`. Alice's messages still target
 `[bob, stepan]`, and Stepan's target `[alice, bob]`, assuming no other blocks.
-Stop following logs with Ctrl-C, then restore Alice's eligibility:
+Observe deliveries in the consumer logs. Restore Alice's eligibility with:
 
 ```bash
-docker-compose run --rm --no-deps kafka-init module2.ChatTopicSetupKt unblock alice bob
-docker-compose logs -f --tail=10 consumer
+docker-compose run --rm --no-deps commands unblock alice bob
 ```
 
 After the unblock is applied, Bob's messages again target `[alice, stepan]`.
@@ -447,6 +489,63 @@ topic-partitions, each with its own offsets and ordering. Neither matching keys
 nor publishing a block first establishes a total order across those inputs.
 Check subsequent delivery logs for the effect; earlier envelopes stay unchanged.
 The topology tests explicitly pipe each update before the message it must affect.
+
+### Global censorship and word matching
+
+`ChatTopology` materializes `module2.chat.stop-words` as the global store
+`chat-stop-words`. Like `chat-users`, it is replicated on every Streams instance
+and accessible without listing it in a processor's `processValues` arguments.
+Its single partition does not need to match the sender topics' three partitions.
+
+`CensorshipProcessor` runs before `RecipientSelectionProcessor`. For each message,
+it collects the current stop words into a set. `censor(text, stopWords)` scans
+complete words, lowercases each with `Locale.ROOT` for comparison, and replaces
+every match with exactly `***`. Unmatched words retain their original case, and
+all separators remain unchanged, including punctuation, spaces, and newlines.
+For this exercise, words consist of Unicode letters, combining marks, numbers,
+and underscores. Thus `bad` matches `BAD!` and `(bad)`, but not `badge`, `bad2`,
+`bad_bad`, or a larger word containing an accent. Hyphens and apostrophes are
+separators. Russian words use the same normalization and matching rules.
+
+The processor preserves the Kafka key and message ID and forwards one message,
+even when its entire text becomes `***`. Recipient selection then applies
+membership and blocking as usual. No recipients still means one envelope with
+an empty recipient list. Later statistics can therefore count the message once.
+
+Stop-word records must already contain a normalized word matching their key.
+As with the user registry, table payloads are validated when a message reads
+the store. Empty words, phrases, punctuation, mismatched or unnormalized entries,
+and malformed Protobuf fail processing. A tombstone removes a rule. Rule updates
+produce no deliveries and do not change previously emitted messages.
+
+This implementation scans the stop-word table for each message, which is simple
+for the exercise's small rule set. That work grows with the number of rules.
+
+### Add and remove stop words
+
+After rebuilding and starting the demo, execute from `assignments/module2`:
+
+```bash
+docker-compose run --rm --no-deps commands add-stop-word ' BAD ' война
+```
+
+The command trims and lowercases each argument before publishing it as both key
+and `StopWord.word`. It validates all arguments before sending any updates.
+`BAD` becomes key/value `bad`; `война` also demonstrates censorship with the
+Russian sentence source. Once applied, `This is BAD!` becomes `This is ***!`,
+`bad badge` becomes `*** badge`, and `ВОЙНА` becomes `***`.
+The producer still reads sentences from its configured source; the exact example
+strings are exercised by the topology tests. Remove rules with:
+
+```bash
+docker-compose run --rm --no-deps commands remove-stop-word BAD война
+```
+
+Removal publishes tombstones under the normalized keys. Repeated adds or removals
+are safe; the commands do not change users or run default topic setup. Existing
+stop words survive restarts until explicitly removed. Kafka acknowledging an
+update does not confirm every instance has applied it; observe subsequent
+deliveries. Tests apply updates synchronously before the messages they affect.
 
 ### Sentence source and sender rotation
 
@@ -534,12 +633,12 @@ docker-compose exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
   A failure can cause an input to be processed again. Transactional processing
   and recovery verification are part of step 9.
 
-The demo now illustrates transport, recipient selection, and blocking. The full
-Alice/Bob/Stepan scenario becomes runnable as censorship and statistics
-are implemented. The producer supplies message text; all business processing
-runs in the Streams application.
+The demo now illustrates transport, censorship, recipient selection, and blocking.
+The full Alice/Bob/Stepan scenario gains its counters as statistics are implemented.
+The producer supplies message text; all business processing runs in the Streams
+application.
 
-### Test recipient selection and blocking
+### Test recipient selection, blocking, and censorship
 
 From the repository root, with JDK 21 and Maven available:
 
@@ -553,6 +652,13 @@ message, joining users, repeated registrations, tombstones and re-registration,
 empty recipient lists, preserved message fields, and invalid IDs or keys.
 Blocking tests cover the step-5 checkpoint, its direction, multiple blockers,
 repeated commands, independent senders, membership changes, and invalid commands.
+Censorship tests cover adding/removing rules, repeated updates, mixed case,
+punctuation and whitespace, repeated matches, longer words, Unicode words,
+fully masked messages, empty recipient lists, and invalid rule payloads. The
+normalization tests also run with Turkish as the default locale to verify
+explicit `Locale.ROOT` handling.
+Command tests use Kafka's `MockProducer` to verify keys, Protobuf values,
+tombstones, normalization, and validation before sending.
 A topology-description assertion checks that both inputs and both processors
 share the blocking store in one subtopology without a repartition source.
 The driver applies global-table input synchronously; the live demo has the
@@ -571,6 +677,14 @@ Alice and Bob. Unblocking restored Alice's eligibility for Bob's messages.
 The topology check confirmed both sender-keyed inputs share the blocking store.
 This checkpoint used `TopologyTestDriver`; it does not verify live cross-topic
 timing or recovery, which remains part of step 9.
+
+Verified step-6 checkpoint (2026-11-03): the Docker image's Maven `verify` build
+passed all 50 tests (43 topology cases and 7 normalization cases). With `bad`
+configured, `This is BAD!` became `This is ***!`, `bad, really bad!` became
+`***, really ***!`, and `badge` stayed unchanged. Removing rules restored their
+original text in subsequent messages. A message containing only `bad` became
+`***` and still emitted exactly one envelope, including with no eligible
+recipients. This checkpoint used `TopologyTestDriver`, not a live broker run.
 
 Stop the module-2 services with:
 
@@ -644,7 +758,7 @@ progresses.
     targets Stepan. Stepan's messages still target Alice and Bob. Unblocking
     restores Alice's eligibility for Bob's subsequent messages.
 
-- [ ] **6. Add global censorship.**
+- [x] **6. Add global censorship.**
 
     Maintain the shared stop-word state. Before recipient selection or
     statistics, replace case-insensitive, whole-word matches with exactly `***`

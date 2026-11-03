@@ -10,6 +10,7 @@ import org.apache.kafka.streams.kstream.Produced
 import org.apache.kafka.streams.state.Stores
 
 const val USERS_STORE = "chat-users"
+const val STOP_WORDS_STORE = "chat-stop-words"
 const val BLOCKED_BY_STORE = "chat-blocked-by"
 
 fun buildChatTopology(): Topology {
@@ -19,6 +20,11 @@ fun buildChatTopology(): Topology {
         ChatTopics.USERS,
         Consumed.with(Serdes.String(), Serdes.ByteArray()).withName("chat-users-input"),
         Materialized.`as`(USERS_STORE),
+    )
+    builder.globalTable(
+        ChatTopics.STOP_WORDS,
+        Consumed.with(Serdes.String(), Serdes.ByteArray()).withName("chat-stop-words-input"),
+        Materialized.`as`(STOP_WORDS_STORE),
     )
 
     builder.addStateStore(
@@ -43,6 +49,9 @@ fun buildChatTopology(): Topology {
     builder.stream(
         ChatTopics.MESSAGES,
         Consumed.with(Serdes.String(), Serdes.ByteArray()).withName("chat-input"),
+    ).processValues(
+        ::CensorshipProcessor,
+        Named.`as`("censor-message"),
     ).processValues(
         ::RecipientSelectionProcessor,
         Named.`as`("select-recipients"),

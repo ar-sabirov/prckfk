@@ -41,9 +41,23 @@ services:
   kafka-init:
     <<: *app
     command: ["module2.ChatTopicSetupKt"]
+    restart: "no"
     depends_on:
       kafka:
         condition: service_healthy
+
+  commands:
+    <<: *app
+    profiles: ["tools"]
+    entrypoint:
+      - java
+      - -Dorg.slf4j.simpleLogger.defaultLogLevel=warn
+      - -cp
+      - /app/app.jar
+      - module2.ChatCommandsKt
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
 
   chat:
     <<: *app
